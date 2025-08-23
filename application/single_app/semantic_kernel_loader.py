@@ -11,11 +11,14 @@ from semantic_kernel.agents import Agent
 from semantic_kernel.connectors.ai.prompt_execution_settings import PromptExecutionSettings
 from semantic_kernel.core_plugins import TimePlugin, HttpPlugin
 from semantic_kernel.core_plugins.wait_plugin import WaitPlugin
+from semantic_kernel_plugins.math_plugin import MathPlugin
+from semantic_kernel_plugins.text_plugin import TextPlugin
 from semantic_kernel.functions.kernel_plugin import KernelPlugin
 from semantic_kernel_plugins.embedding_model_plugin import EmbeddingModelPlugin
 from semantic_kernel_plugins.fact_memory_plugin import FactMemoryPlugin
 from functions_settings import get_settings, get_user_settings
 from functions_appinsights import log_event, get_appinsights_logger
+from semantic_kernel_plugins.plugin_health_checker import PluginHealthChecker, PluginErrorRecovery
 from flask import g
 import logging
 import importlib
@@ -25,8 +28,7 @@ import inspect
 import builtins
 
 # Agent and Azure OpenAI chat service imports
-if 'logger' in globals() and logger is not None:
-    log_event("[SK Loader] Starting loader")
+log_event("[SK Loader] Starting loader")
 try:
     from semantic_kernel.agents import ChatCompletionAgent
     from agent_logging_chat_completion import LoggingChatCompletionAgent
@@ -34,14 +36,12 @@ try:
 except ImportError:
     ChatCompletionAgent = None
     AzureChatCompletion = None
-    if 'logger' in globals() and logger is not None:
-        log_event(
-            "[SK Loader] ChatCompletionAgent or AzureChatCompletion not available. Ensure you have the correct Semantic Kernel version.",
-            level=logging.ERROR,
-            exceptionTraceback=True
-        )
-if 'logger' in globals() and logger is not None:    
-    log_event("[SK Loader] Completed imports")
+    log_event(
+        "[SK Loader] ChatCompletionAgent or AzureChatCompletion not available. Ensure you have the correct Semantic Kernel version.",
+        level=logging.ERROR,
+        exceptionTraceback=True
+    )
+log_event("[SK Loader] Completed imports")
 
 
 # Define supported chat types in a single place
@@ -85,12 +85,19 @@ def first_if_comma(val):
         return val
 
 def resolve_agent_config(agent, settings):
+    print(f"[SK Loader] resolve_agent_config called for agent: {agent.get('name')}")
+    print(f"[SK Loader] Agent config: {agent}")
+    
     gpt_model_obj = settings.get('gpt_model', {})
     selected_model = gpt_model_obj.get('selected', [{}])[0] if gpt_model_obj.get('selected') else {}
+    print(f"[SK Loader] Global selected_model: {selected_model}")
+    
     # User APIM enabled if agent has enable_agent_gpt_apim True (or 1, or 'true')
     user_apim_enabled = agent.get("enable_agent_gpt_apim") in [True, 1, "true", "True"]
     global_apim_enabled = settings.get("enable_gpt_apim", False)
     per_user_enabled = settings.get('per_user_semantic_kernel', False)
+    
+    print(f"[SK Loader] user_apim_enabled: {user_apim_enabled}, global_apim_enabled: {global_apim_enabled}, per_user_enabled: {per_user_enabled}")
 
     def any_filled(*fields):
         return any(bool(f) for f in fields)
@@ -165,25 +172,38 @@ def resolve_agent_config(agent, settings):
     g_apim = get_global_apim()
     u_gpt = get_user_gpt()
     g_gpt = get_global_gpt()
+    
+    print(f"[SK Loader] Config sources:")
+    print(f"  u_apim: {u_apim}")
+    print(f"  g_apim: {g_apim}")
+    print(f"  u_gpt: {u_gpt}")
+    print(f"  g_gpt: {g_gpt}")
 
     if user_apim_enabled and any_filled(*u_apim):
         # User APIM is enabled and has values
+        print(f"[SK Loader] Using user APIM with global fallback")
         merged = merge_fields(u_apim, g_apim if global_apim_enabled and any_filled(*g_apim) else (None, None, None, None))
         endpoint, key, deployment, api_version = merged
     elif user_apim_enabled and global_apim_enabled and any_filled(*g_apim):
         # User APIM enabled but no user APIM values, use global APIM if enabled and has values
+        print(f"[SK Loader] Using global APIM")
         endpoint, key, deployment, api_version = g_apim
     elif any_filled(*u_gpt):
-        # Use agent/user GPT config
-        endpoint, key, deployment, api_version = u_gpt
+        # Agent has some GPT config - merge with global GPT config for missing values
+        print(f"[SK Loader] Using agent GPT config merged with global GPT config")
+        merged = merge_fields(u_gpt, g_gpt)
+        print(f"[SK Loader] Merged result: {merged}")
+        endpoint, key, deployment, api_version = merged
     elif global_apim_enabled and any_filled(*g_apim):
         # Use global APIM if enabled and has values
+        print(f"[SK Loader] Using global APIM (fallback)")
         endpoint, key, deployment, api_version = g_apim
     else:
         # Fallback to global GPT config
+        print(f"[SK Loader] Using global GPT config (fallback)")
         endpoint, key, deployment, api_version = g_gpt
 
-    return {
+    result = {
         "endpoint": endpoint,
         "key": key,
         "deployment": deployment,
@@ -199,6 +219,9 @@ def resolve_agent_config(agent, settings):
         "is_global": agent.get("is_global", False),  # Ensure we have this field
         "enable_agent_gpt_apim": agent.get("enable_agent_gpt_apim", False)  # Use this to check if APIM is enabled for the agent
     }
+    
+    print(f"[SK Loader] Final resolved config for {agent.get('name')}: endpoint={bool(endpoint)}, key={bool(key)}, deployment={deployment}")
+    return result
 
 def load_time_plugin(kernel: Kernel):
     kernel.add_plugin(
@@ -219,6 +242,20 @@ def load_wait_plugin(kernel: Kernel):
         WaitPlugin(),
         plugin_name="wait",
         description="Provides wait functions for delaying execution."
+    )
+
+def load_math_plugin(kernel: Kernel):
+    kernel.add_plugin(
+        MathPlugin(),
+        plugin_name="math",
+        description="Provides mathematical calculation functions."
+    )
+
+def load_text_plugin(kernel: Kernel):
+    kernel.add_plugin(
+        TextPlugin(),
+        plugin_name="text",
+        description="Provides text manipulation functions."
     )
 
 def load_fact_memory_plugin(kernel: Kernel):
@@ -259,19 +296,44 @@ def initialize_semantic_kernel(user_id: str=None, redis_client=None):
         level=logging.INFO
     )
     settings = get_settings()
+    print(f"[SK Loader] Settings check - per_user_semantic_kernel: {settings.get('per_user_semantic_kernel', False)}, user_id: {user_id}")
+    log_event(f"[SK Loader] Settings check - per_user_semantic_kernel: {settings.get('per_user_semantic_kernel', False)}, user_id: {user_id}", level=logging.INFO)
+    
     if settings.get('per_user_semantic_kernel', False) and user_id is not None:
+        print("[SK Loader] Using per-user semantic kernel mode")
+        log_event("[SK Loader] Using per-user semantic kernel mode", level=logging.INFO)
         kernel, kernel_agents = load_user_semantic_kernel(kernel, settings, user_id=user_id, redis_client=redis_client)
         g.kernel = kernel
         g.kernel_agents = kernel_agents
+        print(f"[SK Loader] Per-user mode - stored g.kernel_agents: {type(kernel_agents)} with {len(kernel_agents) if kernel_agents else 0} agents")
+        log_event(f"[SK Loader] Per-user mode - stored g.kernel_agents: {type(kernel_agents)} with {len(kernel_agents) if kernel_agents else 0} agents", level=logging.INFO)
     else:
+        print("[SK Loader] Using global semantic kernel mode")
+        log_event("[SK Loader] Using global semantic kernel mode", level=logging.INFO)
         kernel, kernel_agents = load_semantic_kernel(kernel, settings)
         builtins.kernel = kernel
         builtins.kernel_agents = kernel_agents
+        print(f"[SK Loader] Global mode - stored builtins.kernel_agents: {type(kernel_agents)} with {len(kernel_agents) if kernel_agents else 0} agents")
+        log_event(f"[SK Loader] Global mode - stored builtins.kernel_agents: {type(kernel_agents)} with {len(kernel_agents) if kernel_agents else 0} agents", level=logging.INFO)
+        
     if kernel and not kernel_agents:
+        print("[SK Loader] Failed to load Agents - kernel_agents is None or empty!")
         log_event(
-            "[SK Loader] Failed to load Agents.",
+            "[SK Loader] Failed to load Agents - kernel_agents is None or empty!",
             level=logging.ERROR
         )
+    elif kernel_agents:
+        agent_names = []
+        if isinstance(kernel_agents, dict):
+            agent_names = list(kernel_agents.keys())
+        else:
+            agent_names = [getattr(agent, 'name', 'unnamed') for agent in kernel_agents]
+        print(f"[SK Loader] Successfully loaded {len(kernel_agents)} agents: {agent_names}")
+        log_event(f"[SK Loader] Successfully loaded {len(kernel_agents)} agents: {agent_names}", level=logging.INFO)
+    else:
+        print("[SK Loader] No agents loaded - kernel_agents is None")
+        log_event("[SK Loader] No agents loaded - kernel_agents is None", level=logging.WARNING)
+        
     log_event(
         "[SK Loader] Semantic Kernel Agent and Plugins loading completed.",
         extra={
@@ -290,15 +352,23 @@ def load_single_agent_for_kernel(kernel, agent_cfg, settings, context_obj, redis
     - mode_label: 'per-user' or 'global' (for logging)
     Returns: kernel, agent_objs // dict (name->agent) or None
     """
+    print(f"[SK Loader] load_single_agent_for_kernel starting - agent: {agent_cfg.get('name')}, mode: {mode_label}")
+    log_event(f"[SK Loader] load_single_agent_for_kernel starting - agent: {agent_cfg.get('name')}, mode: {mode_label}", level=logging.INFO)
+    
     # Redis is now optional for per-user mode
     if mode_label == "per-user":
         context_obj.redis_client = redis_client
     agent_objs = {}
     agent_config = resolve_agent_config(agent_cfg, settings)
+    print(f"[SK Loader] Agent config resolved for {agent_cfg.get('name')}: endpoint={bool(agent_config.get('endpoint'))}, key={bool(agent_config.get('key'))}, deployment={agent_config.get('deployment')}")
     service_id = f"aoai-chat-{agent_config['name']}"
     chat_service = None
     apim_enabled = settings.get("enable_gpt_apim", False)
+    
+    log_event(f"[SK Loader] Agent config resolved - endpoint: {bool(agent_config.get('endpoint'))}, key: {bool(agent_config.get('key'))}, deployment: {agent_config.get('deployment')}", level=logging.INFO)
+    
     if AzureChatCompletion and agent_config["endpoint"] and agent_config["key"] and agent_config["deployment"]:
+        print(f"[SK Loader] Azure config valid for {agent_config['name']}, creating chat service...")
         if apim_enabled:
             log_event(
                 f"[SK Loader] Initializing APIM AzureChatCompletion for agent: {agent_config['name']} ({mode_label})",
@@ -349,6 +419,11 @@ def load_single_agent_for_kernel(kernel, agent_cfg, settings, context_obj, redis
             level=logging.INFO
         )
     else:
+        print(f"[SK Loader] Azure config INVALID for {agent_config['name']}:")
+        print(f"  - AzureChatCompletion available: {bool(AzureChatCompletion)}")
+        print(f"  - endpoint: {bool(agent_config.get('endpoint'))}")
+        print(f"  - key: {bool(agent_config.get('key'))}")
+        print(f"  - deployment: {bool(agent_config.get('deployment'))}")
         log_event(
             f"[SK Loader] AzureChatCompletion or configuration not resolved for agent: {agent_config['name']} ({mode_label})",
             {
@@ -360,8 +435,10 @@ def load_single_agent_for_kernel(kernel, agent_cfg, settings, context_obj, redis
             level=logging.ERROR,
             exceptionTraceback=True
         )
+        print(f"[SK Loader] Returning None, None for agent {agent_config['name']} due to invalid config")
         return None, None
     if LoggingChatCompletionAgent and chat_service:
+        print(f"[SK Loader] Creating LoggingChatCompletionAgent for {agent_config['name']}...")
         try:
             kwargs = {
                 "name": agent_config["name"],
@@ -377,6 +454,7 @@ def load_single_agent_for_kernel(kernel, agent_cfg, settings, context_obj, redis
                 kwargs["plugins"] = agent_config["actions_to_load"]
             agent_obj = LoggingChatCompletionAgent(**kwargs)
             agent_objs[agent_config["name"]] = agent_obj
+            print(f"[SK Loader] Successfully created agent {agent_config['name']}")
             log_event(
                 f"[SK Loader] ChatCompletionAgent initialized for agent: {agent_config['name']} ({mode_label})",
                 {
@@ -388,21 +466,28 @@ def load_single_agent_for_kernel(kernel, agent_cfg, settings, context_obj, redis
                 level=logging.INFO
             )
         except Exception as e:
+            print(f"[SK Loader] EXCEPTION creating agent {agent_config['name']}: {e}")
             log_event(
                 f"[SK Loader] Failed to initialize ChatCompletionAgent for agent: {agent_config['name']} ({mode_label}): {e}",
                 {"error": str(e), "agent_name": agent_config["name"]},
                 level=logging.ERROR,
                 exceptionTraceback=True
             )
+            print(f"[SK Loader] Returning None, None due to agent creation exception")
             return None, None
     else:
+        print(f"[SK Loader] Cannot create agent - LoggingChatCompletionAgent available: {bool(LoggingChatCompletionAgent)}, chat_service available: {bool(chat_service)}")
         log_event(
             f"[SK Loader] ChatCompletionAgent or AzureChatCompletion not available for agent: {agent_config['name']} ({mode_label})",
             {"agent_name": agent_config["name"]},
             level=logging.ERROR,
             exceptionTraceback=True
         )
+        print(f"[SK Loader] Returning None, None due to missing dependencies")
         return None, None
+    
+    print(f"[SK Loader] load_single_agent_for_kernel completed - returning {len(agent_objs)} agents: {list(agent_objs.keys())}")
+    log_event(f"[SK Loader] load_single_agent_for_kernel completed - returning {len(agent_objs)} agents: {list(agent_objs.keys())}", level=logging.INFO)
     return kernel, agent_objs
 
 def load_plugins_for_kernel(kernel, plugin_manifests, settings, mode_label="global"):
@@ -432,6 +517,26 @@ def load_plugins_for_kernel(kernel, plugin_manifests, settings, mode_label="glob
             log_event(f"[SK Loader] Failed to load Wait plugin: {e}", level=logging.WARNING)
     else:
         log_event("[SK Loader] Wait plugin not enabled in settings.", level=logging.INFO)
+
+    # Register Math Plugin if enabled
+    if settings.get('enable_math_plugin', True):
+        try:
+            load_math_plugin(kernel)
+            log_event("[SK Loader] Loaded Math plugin.", level=logging.INFO)
+        except Exception as e:
+            log_event(f"[SK Loader] Failed to load Math plugin: {e}", level=logging.WARNING)
+    else:
+        log_event("[SK Loader] Math plugin not enabled in settings.", level=logging.INFO)
+
+    # Register Text Plugin if enabled
+    if settings.get('enable_text_plugin', True):
+        try:
+            load_text_plugin(kernel)
+            log_event("[SK Loader] Loaded Text plugin.", level=logging.INFO)
+        except Exception as e:
+            log_event(f"[SK Loader] Failed to load Text plugin: {e}", level=logging.WARNING)
+    else:
+        log_event("[SK Loader] Text plugin not enabled in settings.", level=logging.INFO)
 
     # Register Fact Memory Plugin if enabled
     if settings.get('enable_fact_memory_plugin', False):
@@ -472,31 +577,74 @@ def load_plugins_for_kernel(kernel, plugin_manifests, settings, mode_label="glob
                     break
             if matched_class:
                 try:
-                    plugin = matched_class(manifest) if 'manifest' in matched_class.__init__.__code__.co_varnames else matched_class()
+                    # Special handling for OpenAPI plugins
+                    if normalized_type == normalize('openapi') or 'openapi' in normalized_type:
+                        from semantic_kernel_plugins.openapi_plugin_factory import OpenApiPluginFactory
+                        # Use the factory to create OpenAPI plugins from configuration
+                        plugin = OpenApiPluginFactory.create_from_config(manifest)
+                    else:
+                        # Standard plugin instantiation with health checking and robust error handling
+                        plugin_instance, instantiation_errors = PluginHealthChecker.create_plugin_safely(
+                            matched_class, manifest, name
+                        )
+                        
+                        if plugin_instance is None:
+                            # Try fallback plugin if main plugin fails
+                            log_event(f"[SK Loader] Creating fallback plugin for {name} due to instantiation failures: {'; '.join(instantiation_errors)}", 
+                                    {"plugin_name": name, "plugin_type": plugin_type, "errors": instantiation_errors}, level=logging.WARNING)
+                            plugin_instance = PluginErrorRecovery.create_fallback_plugin(name, plugin_type)
+                        
+                        if plugin_instance is None:
+                            raise Exception(f"Both main and fallback plugin creation failed: {'; '.join(instantiation_errors)}")
+                        
+                        plugin = plugin_instance
+                    
+                    # Validate plugin has required methods
+                    if hasattr(plugin, 'get_functions'):
+                        try:
+                            functions = plugin.get_functions()
+                            log_event(f"[SK Loader] Plugin {name} exposes {len(functions) if functions else 0} functions", 
+                                    {"plugin_name": name, "plugin_type": plugin_type, "function_count": len(functions) if functions else 0}, 
+                                    level=logging.DEBUG)
+                        except Exception as e:
+                            log_event(f"[SK Loader] Warning: Plugin {name} get_functions() failed: {e}", 
+                                    {"plugin_name": name, "plugin_type": plugin_type, "error": str(e)}, level=logging.WARNING)
+                    
                     kernel.add_plugin(KernelPlugin.from_object(name, plugin, description=description))
-                    log_event(f"[SK Loader] Loaded plugin: {name} (type: {plugin_type}) [{mode_label}]", {"plugin_name": name, "plugin_type": plugin_type}, level=logging.INFO)
+                    log_event(f"[SK Loader] Successfully loaded plugin: {name} (type: {plugin_type}) [{mode_label}]", 
+                            {"plugin_name": name, "plugin_type": plugin_type}, level=logging.INFO)
                 except Exception as e:
-                    log_event(f"[SK Loader] Failed to instantiate plugin: {name}: {e}", {"plugin_name": name, "plugin_type": plugin_type, "error": str(e)}, level=logging.ERROR, exceptionTraceback=True)
+                    log_event(f"[SK Loader] Failed to instantiate plugin: {name}: {e}", 
+                            {"plugin_name": name, "plugin_type": plugin_type, "error": str(e), "error_type": type(e).__name__}, 
+                            level=logging.ERROR, exceptionTraceback=True)
+                    # Continue with other plugins instead of failing completely
+                    continue
             else:
-                log_event(f"[SK Loader] Unknown plugin type: {plugin_type} for plugin '{name}' [{mode_label}]", {"plugin_name": name, "plugin_type": plugin_type}, level=logging.WARNING)
+                log_event(f"[SK Loader] Unknown plugin type: {plugin_type} for plugin '{name}' [{mode_label}]", 
+                        {"plugin_name": name, "plugin_type": plugin_type}, level=logging.WARNING)
     except Exception as e:
         log_event(f"[SK Loader] Error discovering plugin types for {mode_label} mode: {e}", {"error": str(e)}, level=logging.ERROR, exceptionTraceback=True)
 
 def load_user_semantic_kernel(kernel: Kernel, settings, user_id: str, redis_client):
+    print("[SK Loader] Per-user Semantic Kernel mode enabled. Loading user-specific plugins and agents.")
     log_event("[SK Loader] Per-user Semantic Kernel mode enabled. Loading user-specific plugins and agents.", 
         level=logging.INFO
     )
     # Redis is now optional for per-user mode. If not present, state will not persist.
     user_settings = get_user_settings(user_id).get('settings', {})
     agents_cfg = user_settings.get('agents', [])
+    print(f"[SK Loader] User settings found {len(agents_cfg)} agents for user '{user_id}'")
+    
     # Always mark user agents as is_global: False
     for agent in agents_cfg:
         agent['is_global'] = False
 
     # PATCH: Merge global agents if enabled
     merge_global = settings.get('merge_global_semantic_kernel_with_workspace', False)
+    print(f"[SK Loader] merge_global_semantic_kernel_with_workspace: {merge_global}")
     if merge_global:
         global_agents = settings.get('semantic_kernel_agents', [])
+        print(f"[SK Loader] Found {len(global_agents)} global agents to merge")
         # Mark global agents
         for agent in global_agents:
             agent['is_global'] = True
@@ -504,6 +652,7 @@ def load_user_semantic_kernel(kernel: Kernel, settings, user_id: str, redis_clie
         all_agents = {a['name']: a for a in global_agents}
         all_agents.update({a['name']: a for a in agents_cfg})
         agents_cfg = list(all_agents.values())
+        print(f"[SK Loader] After merging: {len(agents_cfg)} total agents")
         log_event(f"[SK Loader] Merged global agents into per-user agents: {[a.get('name') for a in agents_cfg]}", level=logging.INFO)
 
     log_event(f"[SK Loader] Found {len(agents_cfg)} agents in user settings for user '{user_id}'.",
@@ -527,59 +676,76 @@ def load_user_semantic_kernel(kernel: Kernel, settings, user_id: str, redis_clie
     load_plugins_for_kernel(kernel, plugin_manifests, settings, mode_label="per-user")
     # Only single-agent supported in per-user mode
     selected_agent = user_settings.get('selected_agent')
+    print(f"[SK Loader] User settings selected_agent: {selected_agent}")
     if isinstance(selected_agent, dict):
         selected_agent_name = selected_agent.get('name')
     else:
+        print(f"[SK Loader] User {user_id} selected_agent is not a dict: {selected_agent}. Using None.")
         log_event(
             f"[SK Loader] User {user_id} selected_agent is not a dict: {selected_agent}. Using None.",
             level=logging.ERROR
         )
         selected_agent_name = None
+    print(f"[SK Loader] Selected agent name: {selected_agent_name}")
     agent_cfg = None
     # Try user-selected agent
     if selected_agent_name:
         found = next((a for a in agents_cfg if a.get('name') == selected_agent_name), None)
         if found:
+            print(f"[SK Loader] User {user_id} Found user-selected agent: {selected_agent_name}")
             logging.debug(f"[SK Loader] User {user_id} Found user-selected agent: {selected_agent_name}")
             agent_cfg = found
         else:
+            print(f"[SK Loader] User {user_id} No agent found matching user-selected agent: {selected_agent_name}")
             log_event(
                 f"[SK Loader] User {user_id} No agent found matching user-selected agent: {selected_agent_name}",
                 level=logging.WARNING
             )
     # If not found, try global selected agent
     if agent_cfg is None:
+        print(f"[SK Loader] User {user_id} No user-selected agent found. Trying global selected agent.")
         logging.debug(f"[SK Loader] User {user_id} No user-selected agent found. Trying global selected agent.")
         global_selected_agent_info = settings.get('global_selected_agent')
+        print(f"[SK Loader] Global selected agent info: {global_selected_agent_info}")
         if global_selected_agent_info:
             global_selected_agent_name = global_selected_agent_info.get('name')
             found = next((a for a in agents_cfg if a.get('name') == global_selected_agent_name), None)
             if found:
+                print(f"[SK Loader] User {user_id} Found global selected agent: {global_selected_agent_name}")
                 logging.debug(f"[SK Loader] User {user_id} Found global selected agent: {global_selected_agent_name}")
                 agent_cfg = found
             else:
+                print(f"[SK Loader] User {user_id} No agent found matching global selected agent: {global_selected_agent_name}")
                 log_event(
                     f"[SK Loader] User {user_id} No agent found matching global selected agent: {global_selected_agent_name}",
                     level=logging.WARNING
                 )
     # If still not found, use first agent
     if agent_cfg is None and agents_cfg:
+        print(f"[SK Loader] User {user_id} No user or global selected agent found. Using first agent: {agents_cfg[0].get('name')}")
         agent_cfg = agents_cfg[0]
         log_event(
             f"[SK Loader] User {user_id} No user or global selected agent found. Using first agent: {agent_cfg.get('name')}",
             level=logging.WARNING
         )
     if agent_cfg is None:
+        print(f"[SK Loader] User {user_id} No agent found to load for user. Proceeding in kernel-only mode (per-user).")
         log_event("[SK Loader] No agent found to load for user. Proceeding in kernel-only mode (per-user).", level=logging.INFO)
         return kernel, None
+    
+    print(f"[SK Loader] User {user_id} Loading agent: {agent_cfg.get('name')}")
     kernel, agent_objs = load_single_agent_for_kernel(kernel, agent_cfg, settings, g, redis_client=redis_client, mode_label="per-user")
+    print(f"[SK Loader] User {user_id} Agent loading completed. Agent objects: {type(agent_objs)} with {len(agent_objs) if agent_objs else 0} items")
     return kernel, agent_objs
 
 def load_semantic_kernel(kernel: Kernel, settings):
     log_event("[SK Loader] Loading Semantic Kernel plugins...")
     log_event("[SK Loader] Global Semantic Kernel mode enabled. Loading global plugins and agents.", level=logging.INFO)
+    
     # Conditionally load core plugins based on settings
     plugin_manifests = settings.get('semantic_kernel_plugins', [])
+    log_event(f"[SK Loader] Found {len(plugin_manifests)} plugin manifests", level=logging.INFO)
+    
     # --- Dynamic Plugin Type Loading (semantic_kernel_plugins) ---
     load_plugins_for_kernel(kernel, plugin_manifests, settings, mode_label="global")
 
@@ -588,6 +754,9 @@ def load_semantic_kernel(kernel: Kernel, settings):
     agents_cfg = settings.get('semantic_kernel_agents', [])
     enable_multi_agent_orchestration = settings.get('enable_multi_agent_orchestration', False)
     merge_global = settings.get('merge_global_semantic_kernel_with_workspace', False)
+    
+    log_event(f"[SK Loader] Configuration check - agents_cfg count: {len(agents_cfg)}, enable_multi_agent_orchestration: {enable_multi_agent_orchestration}, merge_global: {merge_global}", level=logging.INFO)
+    
     # PATCH: Merge global agents if enabled
     if merge_global:
         global_agents = []
@@ -607,7 +776,11 @@ def load_semantic_kernel(kernel: Kernel, settings):
         agents_cfg = merged_agents
         log_event(f"[SK Loader] Merged global agents into workspace agents: {[a.get('name') for a in agents_cfg]}", level=logging.INFO)
     # END PATCH
+    
+    agent_objs = None
+    
     if enable_multi_agent_orchestration and len(agents_cfg) > 0:
+        log_event(f"[SK Loader] Starting multi-agent orchestration setup with {len(agents_cfg)} agents", level=logging.INFO)
         agent_objs = {}
         orchestrator_cfg = None
         specialist_agents: list[Agent] = []
@@ -819,6 +992,8 @@ def load_semantic_kernel(kernel: Kernel, settings):
                 log_event(f"[SK Loader] Failed to initialize OrchestratorAgent: {e}", {"error": str(e)}, level=logging.ERROR, exceptionTraceback=True)
 # region Single-agent orchestration
     else:
+        log_event(f"[SK Loader] Multi-agent orchestration check: enable_multi_agent_orchestration={enable_multi_agent_orchestration}, agents_cfg_count={len(agents_cfg)}", level=logging.INFO)
+        
         if enable_multi_agent_orchestration:
             # Multi-agent orchestration is enabled but no agents defined
             log_event("[SK Loader] Multi-agent orchestration is enabled but no agents defined in settings.", level=logging.WARNING)
@@ -828,18 +1003,26 @@ def load_semantic_kernel(kernel: Kernel, settings):
         agents_cfg = settings.get('semantic_kernel_agents', [])
         global_selected_agent_cfg = None
         global_selected_agent_info = settings.get('global_selected_agent')
+        
+        log_event(f"[SK Loader] Single-agent mode - agents_cfg count: {len(agents_cfg)}, global_selected_agent_info: {global_selected_agent_info}", level=logging.INFO)
+        
         if global_selected_agent_info:
             global_selected_agent_cfg = next((a for a in agents_cfg if a.get('name') == global_selected_agent_info.get('name')), None)
             if not global_selected_agent_cfg:
                 log_event(f"[SK Loader] global_selected_agent name '{global_selected_agent_info.get('name')}' not found in semantic_kernel_agents. Fallback to first agent.", level=logging.WARNING)
                 if agents_cfg:
                     global_selected_agent_cfg = agents_cfg[0]
+            else:
+                log_event(f"[SK Loader] Found global_selected_agent config: {global_selected_agent_cfg.get('name')}", level=logging.INFO)
         else:
             if agents_cfg:
                 global_selected_agent_cfg = agents_cfg[0]
+                log_event(f"[SK Loader] No global_selected_agent_info, using first agent: {global_selected_agent_cfg.get('name')}", level=logging.INFO)
+                
         if global_selected_agent_cfg:
             log_event(f"[SK Loader] Using global_selected_agent: {global_selected_agent_cfg.get('name')}", level=logging.INFO)
             kernel, agent_objs = load_single_agent_for_kernel(kernel, global_selected_agent_cfg, settings, builtins, redis_client=None, mode_label="global")
+            log_event(f"[SK Loader] load_single_agent_for_kernel returned agent_objs: {type(agent_objs)} with {len(agent_objs) if agent_objs else 0} agents", level=logging.INFO)
         else:
             log_event("[SK Loader] No global_selected_agent found. Proceeding in kernel-only mode.", level=logging.WARNING)
             agent_objs = None
@@ -886,6 +1069,12 @@ def load_semantic_kernel(kernel: Kernel, settings):
                 )
 
     # Return both kernel and all agents (including orchestrator) for use in the app
+    log_event(f"[SK Loader] load_semantic_kernel final return - agent_objs: {type(agent_objs)} with {len(agent_objs) if agent_objs else 0} agents", level=logging.INFO)
+    if agent_objs:
+        agent_names = list(agent_objs.keys()) if isinstance(agent_objs, dict) else [getattr(agent, 'name', 'unnamed') for agent in agent_objs]
+        log_event(f"[SK Loader] Returning agent names: {agent_names}", level=logging.INFO)
+    else:
+        log_event("[SK Loader] Returning None for agent_objs", level=logging.WARNING)
     return kernel, agent_objs
 
 
