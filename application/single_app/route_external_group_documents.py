@@ -83,14 +83,6 @@ def register_route_external_group_documents(app):
                     percentage_complete=0
                 )
 
-                future = executor.submit(
-                    process_document_upload_background,
-                    document_id=parent_document_id,
-                    group_id=active_group_id,
-                    user_id=user_id,
-                    temp_file_path=temp_file_path,
-                    original_filename=original_filename
-                )
                 executor.submit_stored(
                     parent_document_id, 
                     process_document_upload_background, 
