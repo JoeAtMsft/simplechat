@@ -2,6 +2,16 @@
 
 For feature-focused and fix-focused drill-downs by version, see [Features by Version](https://github.com/microsoft/simplechat/tree/main/docs/explanation/features) and [Fixes by Version](https://github.com/microsoft/simplechat/tree/main/docs/explanation/fixes).
 
+### **(v0.261.028)**
+
+#### Bug Fixes
+
+*   **SQL Managed Identity Action Saving**
+    *   Fixed SQL Query and SQL Schema actions failing to save with `'identity' is a required property` after a successful managed-identity connection test.
+    *   System-assigned managed identity now saves without requiring a client ID or SQL password, while preserving existing authentication modes and shared validation requirements.
+    *   Added functional and browser regression coverage. Deploy the updated app, restart the affected slot, and refresh the browser before retrying.
+    *   (Ref: `plugin_modal_stepper.js`, `test_sql_managed_identity_manifest.py`, `test_sql_managed_identity_save.py`, [fix details](fixes/SQL_MANAGED_IDENTITY_SAVE_FIX.md))
+
 ### **(v0.261.027)**
 
 #### Bug Fixes

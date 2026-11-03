@@ -36,6 +36,22 @@ Use SQL Query when the answer depends on exact relational data: joins, filters, 
 7. Set **Max Rows** and **Timeout (seconds)**.
 8. Use **Test Connection**, then save.
 
+### App Service system-assigned managed identity
+
+For Azure SQL, enable the identity on the App Service or deployment slot running
+SimpleChat, create its Microsoft Entra user in the target database, and grant
+`db_datareader` or narrower `SELECT` permissions. An Azure IAM Reader role does
+not grant SQL data access.
+
+Choose **Managed Identity (Azure)** and leave SQL username/password credentials
+empty. No client ID is needed for a system-assigned identity. Test from the
+deployed app; a local process cannot use the App Service identity.
+
+**Fixed in version: 0.261.028.** The wizard now includes the internal managed
+identity marker when saving, preventing an `'identity' is a required property`
+error after a successful connection test. See the
+[managed identity save fix](../../explanation/fixes/SQL_MANAGED_IDENTITY_SAVE_FIX.md).
+
 ## Example prompts
 
 - "How many open support tickets were created last week by product area?"
@@ -55,4 +71,3 @@ Use SQL Query when the answer depends on exact relational data: joins, filters, 
 - [SQL Schema](../sql-schema/)
 - [Actions reference index]({{ '/reference/actions/' | relative_url }})
 - [Agents administration]({{ '/admin/agents-actions/' | relative_url }})
-

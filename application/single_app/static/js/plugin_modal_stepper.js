@@ -6714,8 +6714,10 @@ export class PluginModalStepper {
             auth.tenantId = tenantId;
             break;
 
-          case 'integrated':
           case 'managed_identity':
+            auth.identity = 'managed_identity';
+            break;
+          case 'integrated':
           case 'connection_string_only':
             // No additional fields needed
             break;

@@ -35,6 +35,13 @@ Use SQL Schema when an agent must understand table names, column names, types, a
 6. Use **Table Filter** to narrow discovery, for example `user_*` or `*_log`.
 7. Use **Test Connection** before saving.
 
+For Azure SQL on App Service, **Managed Identity (Azure)** can use the running
+app or slot's system-assigned identity without a client ID or SQL password.
+Grant that identity access inside the target database. See
+[SQL Query managed identity setup](../sql-query/#app-service-system-assigned-managed-identity).
+The save-validation fix for this mode applies to both SQL actions in version
+**0.261.028**.
+
 ## Example prompts
 
 - "What tables are available for order history, and how are they related?"
@@ -54,4 +61,3 @@ Use SQL Schema when an agent must understand table names, column names, types, a
 - [SQL Query](../sql-query/)
 - [Actions reference index]({{ '/reference/actions/' | relative_url }})
 - [Agents administration]({{ '/admin/agents-actions/' | relative_url }})
-
