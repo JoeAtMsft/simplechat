@@ -69,3 +69,6 @@ local_storage_state.json
 .pytest_cache
 .playwright-mcp
 .impeccable
+
+# Local blob downloads
+/va-data/
