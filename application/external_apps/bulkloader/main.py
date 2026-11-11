@@ -3,16 +3,20 @@ import csv
 import logging
 import math
 import os
+import socket
 import sys
 import time
+import webbrowser
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from enum import Enum
+from uuid import UUID
+from urllib.parse import urlsplit
 
 import requests
 from dotenv import load_dotenv
-from msal import ConfidentialClientApplication
+from msal import ConfidentialClientApplication, PublicClientApplication
 
 
 load_dotenv()
@@ -22,6 +26,8 @@ TENANT_ID = os.getenv("AZURE_TENANT_ID")
 CLIENT_ID = os.getenv("AZURE_CLIENT_ID")
 CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET")
 API_SCOPE = os.getenv("API_SCOPE")
+INTERACTIVE_CLIENT_ID = os.getenv("INTERACTIVE_CLIENT_ID")
+INTERACTIVE_API_SCOPE = os.getenv("INTERACTIVE_API_SCOPE")
 API_BASE_URL = os.getenv("API_BASE_URL")
 GROUP_DOCUMENTS_UPLOAD_URL = f"{API_BASE_URL}/external/group_documents/upload"
 PUBLIC_DOCUMENTS_UPLOAD_URL = f"{API_BASE_URL}/external/public_documents/upload"
@@ -30,6 +36,7 @@ GROUP_DOCUMENTS_LIST_URL = f"{API_BASE_URL}/external/group_documents"
 BEARER_TOKEN_TEST_URL = f"{API_BASE_URL}/external/testaccesstoken"
 UPLOAD_DIRECTORY = os.getenv("UPLOAD_DIRECTORY")
 g_ACCESS_TOKEN = None
+g_INTERACTIVE_AUTH = None
 MAX_RETRIES = 100
 RETRY_DELAY = 60
 
@@ -49,49 +56,198 @@ class UploadOutcome(Enum):
     FAILED = "failed"
 
 
+class InteractiveAuthentication:
+    """Keep delegated tokens and the selected tenant identity in memory for one run."""
+
+    def __init__(self, mode):
+        self.mode = mode
+        self.scopes = [INTERACTIVE_API_SCOPE]
+        self.client = PublicClientApplication(
+            client_id=INTERACTIVE_CLIENT_ID or CLIENT_ID,
+            authority=f"{AUTHORITY_URL.rstrip('/')}/{TENANT_ID}",
+        )
+        self.user_id = None
+        self.account = None
+
+    def acquire_token(self):
+        if self.account is not None:
+            result = self.client.acquire_token_silent(
+                self.scopes, account=self.account, force_refresh=True
+            )
+            if not result:
+                raise RuntimeError("Interactive token refresh failed; rerun the command to sign in again.")
+        elif self.mode == "device-code":
+            result = self.acquire_device_token()
+        else:
+            print("Opening your browser to sign in. Use --auth device-code if a browser is unavailable.")
+            try:
+                result = self.client.acquire_token_interactive(
+                    scopes=self.scopes, prompt="select_account", timeout=180
+                )
+            except (OSError, RuntimeError, webbrowser.Error) as error:
+                appLogger.warning("Browser sign-in unavailable or timed out (%s); using device code.", error)
+                result = self.acquire_device_token()
+        if not isinstance(result, dict) or not result.get("access_token"):
+            error = result.get("error", "no_token") if isinstance(result, dict) else "no_result"
+            description = result.get("error_description", "") if isinstance(result, dict) else ""
+            raise RuntimeError(f"Interactive authentication failed: {error}: {description}")
+        claims = result.get("id_token_claims")
+        if self.user_id is None or claims is not None:
+            if not isinstance(claims, dict):
+                raise ValueError("Sign-in did not return user identity claims.")
+            oid, tenant = claims.get("oid"), claims.get("tid")
+            try:
+                user_id = str(UUID(oid))
+                tenant_id = str(UUID(tenant))
+                expected_tenant = str(UUID(TENANT_ID))
+            except (ValueError, TypeError, AttributeError) as error:
+                raise ValueError("Sign-in requires valid Entra oid/tid claims and a tenant GUID.") from error
+            if tenant_id != expected_tenant:
+                raise ValueError("Signed-in user belongs to a different tenant.")
+            if self.user_id is not None and user_id != self.user_id:
+                raise ValueError("Token refresh changed the signed-in user; aborting.")
+            self.user_id = user_id
+        if self.account is None:
+            self.account = next((
+                account for account in self.client.get_accounts()
+                if account.get("local_account_id", "").lower() == self.user_id
+                and account.get("realm", "").lower() == str(UUID(TENANT_ID))
+            ), None)
+            if self.account is None:
+                raise RuntimeError("The signed-in account was not found in the MSAL cache.")
+            appLogger.info("Signed in; using Entra user ID %s for this run.", self.user_id)
+        return result["access_token"]
+
+    def acquire_device_token(self):
+        flow = self.client.initiate_device_flow(scopes=self.scopes)
+        if not isinstance(flow, dict) or not flow.get("user_code") or not flow.get("message"):
+            error = flow.get("error", "invalid_device_flow") if isinstance(flow, dict) else "no_result"
+            raise RuntimeError(f"Could not start device-code sign-in: {error}")
+        # Device codes are shown only in the terminal, never written to log files.
+        print(flow["message"], flush=True)
+        return self.client.acquire_token_by_device_flow(flow)
+
+
 def setup_FileLoggers(name, log_file, level=logging.DEBUG):
     handler = logging.FileHandler(log_file)
     handler.setFormatter(file_formatter)
     logger = logging.getLogger(name)
     logger.setLevel(level)
+    logger.propagate = False
     logger.addHandler(handler)
     return logger
 
 
-def configure_logging():
+def configure_logging(verbose=False):
     global successFileLogger, ignoredFileLogger
+    level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
         filename=appLogname,
         filemode='a',
         format='%(asctime)s,%(msecs)03d %(name)s %(levelname)s %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S',
-        level=logging.DEBUG,
+        level=level,
     )
     stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setLevel(level)
     stdout_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
     logging.getLogger().addHandler(stdout_handler)
+    logging.getLogger("msal").setLevel(logging.WARNING)
     successFileLogger = setup_FileLoggers('success_file_logger', success_fileLogname)
     ignoredFileLogger = setup_FileLoggers('ignored_file_logger', ignored_fileLogname)
 
 
-def validate_configuration(action):
+def log_runtime_diagnostics():
+    if not appLogger.isEnabledFor(logging.DEBUG):
+        return
+    proxy_names = [
+        name for name in (
+            "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+            "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+        ) if os.environ.get(name)
+    ]
+    appLogger.debug(
+        "Runtime diagnostic: executable=%s; Python=%s; requests=%s; urllib3=%s; "
+        "API hostname=%r; resolver=%s.%s; proxy environment variable names=%s",
+        sys.executable, sys.version.split()[0], requests.__version__,
+        requests.packages.urllib3.__version__, urlsplit(API_BASE_URL).hostname,
+        socket.getaddrinfo.__module__, socket.getaddrinfo.__name__, proxy_names,
+    )
+
+
+def log_transport_diagnostics(method, url, error):
+    if not appLogger.isEnabledFor(logging.DEBUG):
+        return
+    causes = []
+    seen = set()
+    cause = error
+    while cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        causes.append(f"{type(cause).__module__}.{type(cause).__name__}(errno={getattr(cause, 'errno', None)})")
+        cause = cause.__cause__ or cause.__context__
+    appLogger.debug("Transport diagnostic: method=%s; exception chain=%s", method, " -> ".join(causes))
+    try:
+        endpoint = urlsplit(url)
+        hostname = endpoint.hostname
+        port = endpoint.port or (443 if endpoint.scheme == "https" else 80)
+    except ValueError:
+        appLogger.debug("Transport diagnostic: endpoint could not be parsed; no resolver probe performed.")
+        return
+    if not hostname:
+        appLogger.debug("Transport diagnostic: endpoint has no hostname; no resolver probe performed.")
+        return
+    try:
+        addresses = sorted({
+            address[4][0] for address in socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+        })
+    except OSError as probe_error:
+        appLogger.debug(
+            "Independent resolver probe: hostname=%r; port=%s; result=%s; errno=%s",
+            hostname, port, type(probe_error).__name__, probe_error.errno,
+        )
+    else:
+        appLogger.debug(
+            "Independent resolver probe: hostname=%r; port=%s; addresses=%s. "
+            "This probe does not establish why the earlier request failed.",
+            hostname, port, addresses,
+        )
+
+
+def validate_configuration(action, auth_mode="application", upload_directory=None):
     settings = {
         "AUTHORITY_URL": AUTHORITY_URL,
         "AZURE_TENANT_ID": TENANT_ID,
-        "AZURE_CLIENT_ID": CLIENT_ID,
-        "AZURE_CLIENT_SECRET": CLIENT_SECRET,
-        "API_SCOPE": API_SCOPE,
         "API_BASE_URL": API_BASE_URL,
     }
+    if auth_mode == "application":
+        settings.update(AZURE_CLIENT_ID=CLIENT_ID, AZURE_CLIENT_SECRET=CLIENT_SECRET, API_SCOPE=API_SCOPE)
+    else:
+        settings.update(
+            INTERACTIVE_CLIENT_ID=INTERACTIVE_CLIENT_ID or CLIENT_ID,
+            INTERACTIVE_API_SCOPE=INTERACTIVE_API_SCOPE,
+        )
     missing = [name for name, value in settings.items() if not value or not value.strip()]
     if missing:
         raise ValueError(f"Missing environment settings: {', '.join(missing)}")
-    if action == "upload" and (not UPLOAD_DIRECTORY or not os.path.isdir(UPLOAD_DIRECTORY)):
-        raise ValueError(f"Upload directory does not exist: {UPLOAD_DIRECTORY}")
+    if auth_mode != "application":
+        UUID(TENANT_ID)
+        if (
+            not INTERACTIVE_API_SCOPE.startswith("api://")
+            or INTERACTIVE_API_SCOPE.endswith("/.default")
+            or len(INTERACTIVE_API_SCOPE.split()) != 1
+            or not INTERACTIVE_API_SCOPE.rsplit("/", 1)[-1]
+        ):
+            raise ValueError("INTERACTIVE_API_SCOPE must be one explicit SimpleChat delegated api:// scope.")
+    if action == "upload":
+        directory = UPLOAD_DIRECTORY if upload_directory is None else upload_directory
+        if not directory or not os.path.isdir(directory):
+            raise ValueError(f"Upload directory does not exist: {directory}")
 
 
 def get_access_token():
-    """Acquire an application token using the configured client credentials."""
+    """Acquire or refresh a token using the selected authentication mode."""
+    if g_INTERACTIVE_AUTH is not None:
+        return g_INTERACTIVE_AUTH.acquire_token()
     app = ConfidentialClientApplication(
         client_id=CLIENT_ID,
         client_credential=CLIENT_SECRET,
@@ -105,13 +261,18 @@ def get_access_token():
     return result["access_token"]
 
 
-def workspace_parameters(user_id, workspace_id, scope):
+def workspace_parameters(user_id, workspace_id, scope, require_user_id=True):
     if scope not in ("public", "group"):
         raise ValueError(f"Invalid workspace scope: {scope}")
-    if not user_id or not user_id.strip() or not workspace_id or not workspace_id.strip():
-        raise ValueError("User ID and workspace ID are required.")
+    if not workspace_id or not workspace_id.strip():
+        raise ValueError("Workspace ID is required.")
+    if require_user_id and (not user_id or not user_id.strip()):
+        raise ValueError("User ID is required.")
     key = "active_workspace_id" if scope == "public" else "active_group_id"
-    return {"user_id": user_id.strip(), key: workspace_id.strip()}
+    params = {key: workspace_id.strip()}
+    if user_id and user_id.strip():
+        params["user_id"] = user_id.strip()
+    return params
 
 
 def retry_delay(response):
@@ -141,8 +302,25 @@ def api_request(method, url, access_token=None, **kwargs):
     for attempt in range(MAX_RETRIES):
         for _, stream in kwargs.get("files", {}).values():
             stream.seek(0)
-        response = requests.request(
-            method, url, headers={"Authorization": f"Bearer {token}"}, timeout=60, **kwargs
+        started = time.monotonic()
+        appLogger.debug(
+            "API request: method=%s; hostname=%r; attempt=%s/%s",
+            method, urlsplit(url).hostname, attempt + 1, MAX_RETRIES,
+        )
+        try:
+            response = requests.request(
+                method, url, headers={"Authorization": f"Bearer {token}"}, timeout=60, **kwargs
+            )
+        except requests.RequestException as error:
+            appLogger.debug(
+                "API request raised %s after %.3f seconds; no retry will be attempted for this transport failure.",
+                type(error).__name__, time.monotonic() - started,
+            )
+            log_transport_diagnostics(method, url, error)
+            raise
+        appLogger.debug(
+            "API response: method=%s; status=%s; elapsed=%.3f seconds",
+            method, response.status_code, time.monotonic() - started,
         )
         if response.status_code not in (401, 429):
             response.raise_for_status()
@@ -168,6 +346,14 @@ def test_access_token(access_token):
         if response.status_code != 200:
             raise ValueError(f"Unexpected token test status: {response.status_code}")
         return True
+    except (requests.ConnectionError, requests.Timeout) as error:
+        appLogger.error(
+            "Could not reach the API token-test endpoint: %s. "
+            "This is a transport failure, not evidence that the token was rejected. "
+            "Use --verbose for runtime and transport diagnostics.",
+            error,
+        )
+        return False
     except (requests.RequestException, ValueError, RuntimeError) as error:
         appLogger.error("Access token validation failed: %s", error)
         return False
@@ -175,10 +361,15 @@ def test_access_token(access_token):
 
 def get_workspace_files(user_id, workspace_id, active_workspace_scope, access_token, search=None):
     """Fetch and validate every page; failed listings must never look empty."""
-    params = workspace_parameters(user_id, workspace_id, active_workspace_scope)
+    params = workspace_parameters(
+        user_id, workspace_id, active_workspace_scope, require_user_id=False
+    )
     params.update(page=1, page_size=25)
     if search is not None:
         params["search"] = search
+        appLogger.debug("Working on filename lookup: %s in %s workspace %s.", search, active_workspace_scope, workspace_id)
+    else:
+        appLogger.info("Working on document listing for %s workspace %s.", active_workspace_scope, workspace_id)
     list_url = (
         PUBLIC_DOCUMENTS_LIST_URL if active_workspace_scope == "public" else GROUP_DOCUMENTS_LIST_URL
     )
@@ -209,6 +400,8 @@ def get_workspace_files(user_id, workspace_id, active_workspace_scope, access_to
         if not page_documents and total > len(documents):
             raise ValueError("Document listing ended before the reported total.")
         documents.extend(page_documents)
+        if search is None and (page == 1 or page % 10 == 0 or page * page_size >= total):
+            appLogger.info("Listing progress: page %s; loaded %s/%s documents.", page, len(documents), total)
         if page * page_size >= total:
             return documents
         params["page"] += 1
@@ -253,6 +446,7 @@ def get_existing_upload_outcome(file_name, user_id, workspace_id, access_token, 
 
 def upload_document(file_path, user_id, active_workspace_scope, active_workspace_id, classification, access_token=None):
     """Queue a file, or report an exact-name completed/incomplete remote match."""
+    appLogger.debug("Working on file upload: %s.", file_path)
     file_name = os.path.basename(file_path)
     try:
         data = workspace_parameters(user_id, active_workspace_id, active_workspace_scope)
@@ -262,7 +456,7 @@ def upload_document(file_path, user_id, active_workspace_scope, active_workspace
         )
         if existing is not None:
             if existing == UploadOutcome.SKIPPED:
-                appLogger.info("Skipping completed exact filename match: %s", file_name)
+                appLogger.debug("Skipping completed exact filename match: %s", file_name)
             if ignoredFileLogger:
                 ignoredFileLogger.debug("%s: %s", existing.value, os.path.abspath(file_path))
             return existing
@@ -294,6 +488,10 @@ def upload_document(file_path, user_id, active_workspace_scope, active_workspace
 
 def read_files_in_directory(directory, user_id, active_workspace_scope, active_workspace_id, classification, access_token=None):
     """Upload immediate files only, returning per-outcome counts."""
+    appLogger.info(
+        "Working on folder upload: %s to %s workspace %s.",
+        directory, active_workspace_scope, active_workspace_id,
+    )
     if not os.path.isdir(directory):
         raise ValueError(f"Directory does not exist: {directory}")
     workspace_parameters(user_id, active_workspace_id, active_workspace_scope)
@@ -301,7 +499,7 @@ def read_files_in_directory(directory, user_id, active_workspace_scope, active_w
     for filename in sorted(os.listdir(directory)):
         file_path = os.path.abspath(os.path.join(directory, filename))
         if not os.path.isfile(file_path):
-            appLogger.info("Skipping non-file: %s", file_path)
+            appLogger.debug("Skipping non-file: %s", file_path)
             continue
         result = upload_document(
             file_path, user_id, active_workspace_scope, active_workspace_id, classification,
@@ -311,8 +509,9 @@ def read_files_in_directory(directory, user_id, active_workspace_scope, active_w
     return summary
 
 
-def read_csv_ignore_header(file_path):
+def read_csv_ignore_header(file_path, override_user_id=None):
     """Validate all mappings before processing any mapped folders."""
+    appLogger.info("Working on CSV upload mappings from %s.", file_path)
     mappings = []
     with open(file_path, newline='', encoding='utf-8-sig') as file:
         reader = csv.reader(file, strict=True)
@@ -326,6 +525,8 @@ def read_csv_ignore_header(file_path):
             if len(row) != 5:
                 raise ValueError(f"Map line {line}: expected five columns, got {len(row)}.")
             folder, user_id, scope, workspace_id, classification = [value.strip() for value in row]
+            if override_user_id is not None:
+                user_id = override_user_id
             if not folder:
                 raise ValueError(f"Map line {line}: folder is required.")
             workspace_parameters(user_id, workspace_id, scope)
@@ -354,6 +555,7 @@ def delete_workspace_file(file_id, user_id, workspace_id, active_workspace_scope
     list_url = (
         PUBLIC_DOCUMENTS_LIST_URL if active_workspace_scope == "public" else GROUP_DOCUMENTS_LIST_URL
     )
+    appLogger.debug("Working on deletion of document %s from %s workspace %s.", file_id, active_workspace_scope, workspace_id)
     response = api_request("DELETE", f"{list_url}/{file_id}", access_token, params=params)
     if response.status_code not in (200, 204):
         raise ValueError(f"Unexpected deletion status for {file_id}: {response.status_code}")
@@ -368,9 +570,18 @@ def get_uploading_workspace_files(files):
     ]
 
 
-def delete_failed_workspace_files(files, user_id, workspace_id, active_workspace_scope, access_token):
-    """Delete only explicitly failed or more-than-12-hour-old incomplete uploads."""
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=12)
+DEFAULT_STALE_HOURS = 12
+
+
+def delete_failed_workspace_files(
+    files, user_id, workspace_id, active_workspace_scope, access_token, stale_hours=DEFAULT_STALE_HOURS
+):
+    """Delete explicitly failed uploads and incomplete uploads older than stale_hours."""
+    appLogger.info(
+        "Working on cleanup: scanning %s documents in %s workspace %s for errors or incomplete uploads older than %g hours.",
+        len(files), active_workspace_scope, workspace_id, stale_hours,
+    )
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=stale_hours)
     deleted = []
     for file in files:
         percent = completion_percentage(file)
@@ -378,6 +589,10 @@ def delete_failed_workspace_files(files, user_id, workspace_id, active_workspace
             appLogger.warning("Preserving document %s: invalid completion metadata.", file.get("id"))
             continue
         if percent == 100:
+            appLogger.debug(
+                "Preserving %s (document %s): completion is 100%%.",
+                file.get("file_name"), file.get("id"),
+            )
             continue
         status = file.get("status")
         failed = isinstance(status, str) and status.startswith("Error:")
@@ -393,7 +608,16 @@ def delete_failed_workspace_files(files, user_id, workspace_id, active_workspace
                 appLogger.warning("Preserving document %s: invalid last_updated (%s).", file.get("id"), error)
                 continue
             if last_updated >= cutoff:
+                appLogger.debug(
+                    "Preserving %s (document %s): recent incomplete upload.",
+                    file.get("file_name"), file.get("id"),
+                )
                 continue
+        appLogger.info(
+            "Cleaning %s (document %s): %s.",
+            file.get("file_name"), file.get("id"),
+            "error status" if failed else f"incomplete and last updated more than {stale_hours:g} hours ago",
+        )
         if not delete_workspace_file(file.get("id"), user_id, workspace_id, active_workspace_scope, access_token):
             raise RuntimeError(f"Deletion failed for document {file.get('id')}.")
         deleted.append(file)
@@ -402,6 +626,10 @@ def delete_failed_workspace_files(files, user_id, workspace_id, active_workspace
 
 
 def delete_duplicate_workspace_files(files, user_id, workspace_id, active_workspace_scope, access_token):
+    appLogger.info(
+        "Working on duplicate cleanup: scanning %s documents in %s workspace %s.",
+        len(files), active_workspace_scope, workspace_id,
+    )
     by_name = defaultdict(list)
     for file in files:
         name = file.get("file_name")
@@ -412,7 +640,15 @@ def delete_duplicate_workspace_files(files, user_id, workspace_id, active_worksp
         keep = next((file for file in matches if document_completed(file)), matches[0])
         for file in matches:
             if file is keep:
+                appLogger.debug(
+                    "Preserving %s (document %s) during duplicate cleanup.",
+                    file.get("file_name"), file.get("id"),
+                )
                 continue
+            appLogger.info(
+                "Cleaning duplicate %s (document %s); retaining document %s.",
+                file.get("file_name"), file.get("id"), keep.get("id"),
+            )
             if not delete_workspace_file(file.get("id"), user_id, workspace_id, active_workspace_scope, access_token):
                 raise RuntimeError(f"Deletion failed for document {file.get('id')}.")
             deleted.append(file)
@@ -421,39 +657,120 @@ def delete_duplicate_workspace_files(files, user_id, workspace_id, active_worksp
 
 
 def main():
-    global g_ACCESS_TOKEN
+    global g_ACCESS_TOKEN, g_INTERACTIVE_AUTH
     parser = argparse.ArgumentParser()
-    parser.add_argument("-a", "--action", choices=["upload", "delete", "clean"], required=True)
-    parser.add_argument("-w", "--workspaceid", help="Workspace ID for clean/delete")
-    parser.add_argument("-u", "--userid", help="User ID for clean/delete")
+    parser.add_argument("-a", "--action", choices=["upload", "list", "delete", "clean"], required=True)
+    parser.add_argument("-w", "--workspaceid", help="Workspace ID for direct-folder upload, list, clean, or delete")
+    parser.add_argument("-u", "--userid", help="User ID for application mode; discovered automatically in interactive mode")
+    parser.add_argument("--auth", choices=["application", "interactive", "device-code"], default="application",
+                        help="Application credentials (default), browser sign-in with device-code fallback, or device code")
     parser.add_argument("-s", "--scope", choices=["public", "group"])
+    parser.add_argument("--folder", help="Upload immediate files from this local folder instead of map.csv")
+    parser.add_argument("--classification", help="Optional classification for --folder uploads (default: empty)")
     parser.add_argument("-dupes", "--removeduplicates", action="store_true",
                         help="Also delete exact-name duplicates during explicit cleanup")
+    parser.add_argument("--incomplete-only", action="store_true",
+                        help="With list, hide files whose status is Processing complete (case-insensitive)")
+    parser.add_argument("--stale-hours", type=float, default=DEFAULT_STALE_HOURS,
+                        help="With clean, delete incomplete uploads last updated more than this many hours ago "
+                             f"(default: {DEFAULT_STALE_HOURS}; 0 deletes every incomplete upload, including active ones)")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Show per-file activity and HTTP diagnostics (default: summaries, warnings, and errors)")
     args = parser.parse_args()
-    if args.action in ("delete", "clean") and not all((args.workspaceid, args.userid, args.scope)):
-        parser.error("workspaceid, userid, and scope are required for delete and clean actions.")
+    direct_upload = args.action == "upload" and args.folder is not None
+    if args.folder is not None and args.action != "upload":
+        parser.error("folder is only supported with --action upload.")
+    if args.classification is not None and not direct_upload:
+        parser.error("classification requires --action upload and --folder.")
+    if direct_upload:
+        if not args.folder.strip():
+            parser.error("folder must not be empty.")
+        if not args.workspaceid or not args.workspaceid.strip() or not args.scope:
+            parser.error("workspaceid and scope are required for --folder uploads.")
+        if args.auth == "application" and (not args.userid or not args.userid.strip()):
+            parser.error("userid is required for --folder uploads with application authentication.")
+    elif args.action == "upload" and any(
+        value is not None for value in (args.workspaceid, args.scope, args.userid)
+    ):
+        parser.error("Upload destination flags require --folder; otherwise destinations come from map.csv.")
+    if args.action in ("list", "delete", "clean") and not all((args.workspaceid, args.scope)):
+        parser.error("workspaceid and scope are required for list, delete, and clean actions.")
+    if args.auth == "application" and args.action in ("delete", "clean") and (not args.userid or not args.userid.strip()):
+        parser.error("userid is required for delete and clean actions.")
+    if args.auth != "application" and args.userid is not None:
+        parser.error("Do not supply userid with interactive authentication; the signed-in user is used.")
     if args.removeduplicates and args.action != "clean":
         parser.error("removeduplicates is only supported with --action clean.")
+    if args.incomplete_only and args.action != "list":
+        parser.error("incomplete-only is only supported with --action list.")
+    if args.stale_hours != DEFAULT_STALE_HOURS and args.action != "clean":
+        parser.error("stale-hours is only supported with --action clean.")
+    if not math.isfinite(args.stale_hours) or args.stale_hours < 0:
+        parser.error("stale-hours must be a non-negative number.")
     try:
-        configure_logging()
-        validate_configuration(args.action)
+        configure_logging(args.verbose)
+        appLogger.info("Starting %s operation.", args.action)
+        validate_configuration(args.action, args.auth, args.folder)
+        log_runtime_diagnostics()
+        appLogger.info("Authenticating using %s mode.", args.auth)
+        g_INTERACTIVE_AUTH = None if args.auth == "application" else InteractiveAuthentication(args.auth)
         g_ACCESS_TOKEN = get_access_token()
+        if g_INTERACTIVE_AUTH is not None:
+            args.userid = g_INTERACTIVE_AUTH.user_id
+            if not args.userid:
+                raise RuntimeError("Interactive sign-in did not resolve a user ID.")
+        appLogger.info("Checking API access before starting document operations.")
         if not g_ACCESS_TOKEN or not test_access_token(g_ACCESS_TOKEN):
-            appLogger.error("Token validation failed; aborting.")
+            appLogger.error("API preflight failed; aborting before document operations.")
             return 1
         if args.action == "upload":
-            summary = read_csv_ignore_header("map.csv")
+            if direct_upload:
+                summary = read_files_in_directory(
+                    args.folder, args.userid, args.scope, args.workspaceid,
+                    args.classification or "", g_ACCESS_TOKEN,
+                )
+            elif g_INTERACTIVE_AUTH is None:
+                summary = read_csv_ignore_header("map.csv")
+            else:
+                appLogger.info("Using the signed-in user for every upload mapping, overriding CSV userId values.")
+                summary = read_csv_ignore_header("map.csv", override_user_id=args.userid)
             appLogger.info(
                 "Upload summary: queued=%s, skipped=%s, blocked=%s, failed=%s",
                 summary["queued"], summary["skipped"], summary["blocked"], summary["failed"],
             )
             return 1 if summary["blocked"] or summary["failed"] else 0
         files = get_workspace_files(args.userid, args.workspaceid, args.scope, g_ACCESS_TOKEN)
+        if args.action == "list":
+            workspace_total = len(files)
+            if args.incomplete_only:
+                files = [
+                    file for file in files
+                    if not (
+                        isinstance(file.get("status"), str)
+                        and file["status"].strip().casefold() == "processing complete"
+                    )
+                ]
+            writer = csv.writer(sys.stdout, delimiter="\t")
+            writer.writerow(["Filename", "Document ID", "Status", "Completion", "Last updated"])
+            for file in files:
+                percent = completion_percentage(file)
+                writer.writerow([
+                    file["file_name"], file.get("id") or "Unknown",
+                    file.get("status") or "Unknown",
+                    f"{percent:g}%" if percent is not None else "Unknown",
+                    file.get("last_updated") or "Unknown",
+                ])
+            if args.incomplete_only:
+                print(f"Total documents: {len(files)} (filtered; workspace total: {workspace_total})")
+            else:
+                print(f"Total documents: {len(files)}")
+            return 0
         if args.action == "delete":
             appLogger.warning("--action delete is not implemented; no documents were deleted.")
             return 0
         deleted = delete_failed_workspace_files(
-            files, args.userid, args.workspaceid, args.scope, g_ACCESS_TOKEN
+            files, args.userid, args.workspaceid, args.scope, g_ACCESS_TOKEN,
+            stale_hours=args.stale_hours,
         )
         if args.removeduplicates:
             deleted_ids = {file["id"] for file in deleted}
@@ -462,6 +779,9 @@ def main():
                 remaining, args.userid, args.workspaceid, args.scope, g_ACCESS_TOKEN
             )
         return 0
+    except KeyboardInterrupt:
+        appLogger.warning("Sign-in or operation cancelled; no further requests will be made.")
+        return 130
     except (OSError, csv.Error, requests.RequestException, ValueError, RuntimeError) as error:
         appLogger.error("Bulk operation failed: %s", error)
         return 1
