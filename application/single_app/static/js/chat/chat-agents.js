@@ -35,6 +35,8 @@ let scopeChangeListenerInitialized = false;
 let pendingScopeNarrowingAgent = null;
 let scopeClearActionInitialized = false;
 let dropdownHideListenerInitialized = false;
+// Agent recorded by the open conversation; it outranks the user-level saved agent.
+let conversationAgentSelection = null;
 
 function hasAgentInteractionControls() {
     return Boolean(enableAgentsBtn && agentSelectContainer && agentSelect);
@@ -602,6 +604,60 @@ export async function initializeAgentInteractions() {
     });
 }
 
+/**
+ * Select the agent a conversation last used, so reopening it does not depend
+ * on whichever agent was chosen in another chat.
+ * @param {Object|null} agentSelection - Saved message metadata `agent_selection`, or null to clear
+ * @returns {Promise<boolean>} True when the dropdown now shows the conversation's agent
+ */
+export async function restoreAgentSelectionFromConversationMetadata(agentSelection) {
+    if (!agentSelection || typeof agentSelection !== 'object') {
+        conversationAgentSelection = null;
+        return false;
+    }
+
+    const restoredAgent = {
+        id: agentSelection.agent_id || null,
+        name: agentSelection.selected_agent || '',
+        is_global: Boolean(agentSelection.is_global),
+        is_group: Boolean(agentSelection.is_group),
+        group_id: agentSelection.group_id || null,
+    };
+    if (!restoredAgent.id && !restoredAgent.name) {
+        conversationAgentSelection = null;
+        return false;
+    }
+
+    // Kept even when the dropdown is not ready so populateAgentDropdown can apply it.
+    conversationAgentSelection = restoredAgent;
+    if (!hasAgentInteractionControls()) {
+        return false;
+    }
+
+    const matchingOption = Array.from(agentSelect.options).find(option => (
+        !option.disabled && doesAgentMatchSelection({
+            id: option.dataset.agentId,
+            name: option.dataset.name,
+            is_global: option.dataset.isGlobal === 'true',
+            is_group: option.dataset.isGroup === 'true',
+            group_id: option.dataset.groupId,
+        }, restoredAgent)
+    ));
+    if (!matchingOption) {
+        return false;
+    }
+
+    agentSelect.value = matchingOption.value;
+    matchingOption.selected = true;
+    agentSelectorController?.refresh();
+
+    // Other chat flows read the saved agent, so keep it aligned with the dropdown.
+    const payload = buildAgentPayloadFromOption(matchingOption);
+    await setSelectedAgent(payload);
+    await syncAssignedKnowledgeForPayload(payload);
+    return true;
+}
+
 export async function populateAgentDropdown() {
     if (!hasAgentInteractionControls()) {
         return;
@@ -612,10 +668,14 @@ export async function populateAgentDropdown() {
     ensureScopeClearAction();
 
     try {
-        const selectedAgent = await fetchSelectedAgent();
+        const savedAgent = await fetchSelectedAgent();
         const scopes = getEffectiveScopes();
         const filteringContext = getConversationFilteringContext();
         const sections = buildAgentSections(getPreloadedAgentOptions(), scopes, filteringContext);
+        const conversationAgentAvailable = Boolean(conversationAgentSelection) && sections.some(section => (
+            section.agents.some(agent => !agent.disabled && doesAgentMatchSelection(agent, conversationAgentSelection))
+        ));
+        const selectedAgent = conversationAgentAvailable ? conversationAgentSelection : savedAgent;
 
         rebuildAgentOptions(sections, selectedAgent, filteringContext);
         updateScopeClearAction(scopes, filteringContext);
@@ -632,6 +692,7 @@ export async function populateAgentDropdown() {
                 console.warn('Selected agent is missing a name, skipping settings update.');
                 return;
             }
+            conversationAgentSelection = null;
             await setSelectedAgent(payload);
             const assignedKnowledgeApplied = await syncAssignedKnowledgeForPayload(payload);
             pendingScopeNarrowingAgent = assignedKnowledgeApplied ? null : payload;

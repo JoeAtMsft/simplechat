@@ -2,6 +2,15 @@
 
 For feature-focused and fix-focused drill-downs by version, see [Features by Version](https://github.com/microsoft/simplechat/tree/main/docs/explanation/features) and [Fixes by Version](https://github.com/microsoft/simplechat/tree/main/docs/explanation/fixes).
 
+### **(v0.261.067)**
+
+#### Bug Fixes
+
+*   **Chat Agent Dropdown Remembers the Agent for Each Conversation**
+    *   Opening a conversation now selects the agent that conversation last used instead of the agent last chosen in another chat, so switching between chats no longer requires reselecting the agent.
+    *   Matching uses stable agent IDs, so renamed agents are still found. Unavailable agents, or chats with no agent replies, leave the dropdown unchanged, and a manual change always takes precedence.
+    *   (Ref: `chat-agents.js`, `chat-messages.js`, [Chat Agent Selection Per Conversation Fix](fixes/CHAT_AGENT_SELECTION_PER_CONVERSATION_FIX.md))
+
 ### **(v0.261.066)**
 
 #### Bug Fixes

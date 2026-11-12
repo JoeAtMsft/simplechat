@@ -29,7 +29,7 @@ import {
   restoreAdminDefaultModelSelection,
   restoreModelSelectionFromConversationMetadata,
 } from './chat-model-selector.js';
-import { areAgentsEnabled } from './chat-agents.js';
+import { areAgentsEnabled, restoreAgentSelectionFromConversationMetadata } from './chat-agents.js';
 import { createThoughtsToggleHtml, attachThoughtsToggleListener } from './chat-thoughts.js';
 import { destroyInlineCharts, extractInlineChartBlocks, hydrateInlineCharts, injectInlineChartHtml, restoreInlineChartTokens } from './chat-inline-charts.js';
 import { attachGeneratedImageProposalResults, extractInlineImageProposalBlocks, hydrateInlineImageProposals, injectInlineImageProposalHtml, restoreInlineImageProposalTokens } from './chat-inline-image-proposals.js';
@@ -2179,6 +2179,21 @@ function getLastConversationModelSelection(messages = []) {
   return null;
 }
 
+function getLastConversationAgentSelection(messages = []) {
+  if (!Array.isArray(messages)) {
+    return null;
+  }
+
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const agentSelection = messages[index]?.metadata?.agent_selection;
+    if (agentSelection && typeof agentSelection === 'object' && (agentSelection.agent_id || agentSelection.selected_agent)) {
+      return agentSelection;
+    }
+  }
+
+  return null;
+}
+
 export function loadMessages(conversationId) {
     window.SimpleChatM365PendingActions?.setConversation(conversationId);
   // Clear search highlights when loading a different conversation
@@ -2223,6 +2238,8 @@ export function loadMessages(conversationId) {
       } else {
         window.adminNewConversationDefaultsActive = false;
       }
+      restoreAgentSelectionFromConversationMetadata(getLastConversationAgentSelection(data.messages))
+        .catch((error) => console.error("Error restoring conversation agent:", error));
       const generatedImageProposalMessages = groupGeneratedImageProposalMessages(data.messages);
       const assistantMessageIds = new Set(
         (Array.isArray(data.messages) ? data.messages : [])
