@@ -4,6 +4,7 @@
 {% endblock %}
 
 {% block head %}
+    <meta name="google" content="notranslate">
     <link rel="stylesheet" href="/static/css/chats.css">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/openlayers/ol.css') }}">
     {% if app_settings.enable_speech_to_text_input %}

@@ -47,6 +47,20 @@ Most support work on Simple Chat starts with one question: is the failure in the
 - [Azure Monitor OpenTelemetry distribution](https://pypi.org/project/azure-monitor-opentelemetry/)
 - [OpenTelemetry SDK environment variable reference](https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/)
 
+## Browser Translation Prompts on the Chats Page
+
+Starting in version **0.261.064**, the chats page includes a `notranslate` meta tag to suppress automatic browser translation prompts in Edge and Chrome. Browsers can misidentify the page language as chat content loads, even though the page declares English.
+
+This intentionally opts the entire chats page, including conversation content, out of browser page translation. Other Simple Chat pages are unchanged. If a translation prompt still appears after an application update, reload the page to ensure the browser receives the updated HTML.
+
+## Static JSON Schema Requests Return HTTP 500
+
+If a request such as `/static/json/schemas/plugin.schema.json` fails with `RuntimeError: Attempted implicit sequence conversion but the response object is in direct passthrough mode`, the Microsoft 365 response-finalization hook is attempting to parse a static file response.
+
+Version **0.261.065** fixes this by skipping direct-passthrough and streaming responses before reading JSON. Static files retain their normal GET, HEAD, and conditional-cache behavior, streams are not consumed by the hook, and buffered JSON responses keep their existing Microsoft 365 completion handling.
+
+Deploy the updated application and restart the running process to load the fix. No plugin schema or authentication configuration changes are required.
+
 ## Backend Call Failing
 
 Simple Chat uses Flask instrumentation by default, and backend calls are logged to Application Insights. Start with the `requests` table to find the failing call, capture the `operation_Id`, and use that identifier to pivot into related exceptions.
@@ -87,4 +101,3 @@ A mixed-source answer may complete with partial coverage when one narrative retr
 5. If aggregate development telemetry is enabled, correlate `MixedSourceTelemetry` events by `request_correlation_id` and inspect only counts, mode, status, cancellation phase, and latency. Source content or identity should never appear.
 
 If cancellation occurs, no final assistant response or new generated artifact should be published. A background tabular export that was already queued is canceled through its existing export run status.
-

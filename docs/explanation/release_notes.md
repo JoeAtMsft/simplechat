@@ -2,6 +2,16 @@
 
 For feature-focused and fix-focused drill-downs by version, see [Features by Version](https://github.com/microsoft/simplechat/tree/main/docs/explanation/features) and [Fixes by Version](https://github.com/microsoft/simplechat/tree/main/docs/explanation/fixes).
 
+### **(v0.261.066)**
+
+#### Bug Fixes
+
+*   **Global Chat Agent Changes Take Effect Without Restarting**
+    *   Global single-agent chat now loads the explicitly selected agent's current instructions and assigned actions for each request instead of reusing the agent loaded at server startup.
+    *   Switching agents and renaming agents or actions referenced by stable IDs now refreshes both streaming and non-streaming chat without a backend restart. Each request keeps its assigned custom actions isolated from other agents.
+    *   Unavailable or failed agent initialization reports an error instead of inheriting the startup agent. Workspace Mode and multi-agent orchestration retain their existing behavior.
+    *   (Ref: `route_backend_chats.py`, `functional_tests/test_global_chat_agent_runtime.py`, [Global Chat Agent Runtime Fix](fixes/GLOBAL_AGENT_REQUEST_RUNTIME_FIX.md))
+
 ### **(v0.261.062)**
 
 #### Bug Fixes

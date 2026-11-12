@@ -1342,7 +1342,7 @@ register_route_blueprint('backend_m365', register_route_backend_m365, user_requi
 
 @app.after_request
 def finalize_m365_json_request(response):
-    if response.is_json:
+    if response.is_json and not response.direct_passthrough and not response.is_streamed:
         payload = response.get_json()
         success = response.status_code < 400 and isinstance(payload, dict) and not (
             payload.get("error") or payload.get("pending") or payload.get("success") is False

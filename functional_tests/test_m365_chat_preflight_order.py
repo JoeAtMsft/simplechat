@@ -1,8 +1,9 @@
 # test_m365_chat_preflight_order.py
 """
 Regression coverage for binding chat actions before Semantic Kernel loading.
-Version: 0.261.032
+Version: 0.261.066
 Implemented in: 0.261.032
+Updated in: 0.261.066 for request-scoped global agent initialization.
 
 Reproduces the empty-tool selection with the real execution preflight, then
 exercises the production chat authorization helper with scoped storage seams.
@@ -131,7 +132,7 @@ def test_stream_authorizes_selected_actions_before_any_kernel_initialization():
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
     ]
     authorizations = [call.lineno for call in calls if call.func.id == "_set_authorized_chat_request_context"]
-    initializations = [call.lineno for call in calls if call.func.id == "initialize_semantic_kernel"]
+    initializations = [call.lineno for call in calls if call.func.id == "_initialize_chat_semantic_kernel"]
     assert authorizations and initializations
     assert max(authorizations) < min(initializations)
 

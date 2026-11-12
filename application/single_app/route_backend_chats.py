@@ -8,7 +8,11 @@ from semantic_kernel.connectors.ai.function_choice_behavior import FunctionChoic
 from semantic_kernel.connectors.ai.chat_completion_client_base import ChatCompletionClientBase
 from semantic_kernel.connectors.ai.open_ai.prompt_execution_settings.azure_chat_prompt_execution_settings import AzureChatPromptExecutionSettings
 from semantic_kernel_fact_memory_store import FactMemoryStore
-from semantic_kernel_loader import initialize_semantic_kernel
+from semantic_kernel_loader import (
+    initialize_semantic_kernel,
+    load_plugins_for_kernel,
+    load_single_agent_for_kernel,
+)
 from semantic_kernel_plugins.plugin_invocation_thoughts import (
     register_plugin_invocation_thought_callback,
 )
@@ -301,6 +305,9 @@ from functions_tabular_generated_exports import (
 
 
 DEFAULT_CONVERSATION_TITLE = 'New Conversation'
+CHAT_AGENT_INITIALIZATION_ERROR_MESSAGE = (
+    'The selected agent could not be loaded. Refresh the agent selection and try again.'
+)
 ASSIGNED_KNOWLEDGE_DOCUMENT_ACTION_MAP = {
     DOCUMENT_ACTION_TYPE_NONE: ASSIGNED_KNOWLEDGE_USER_ACTION_SEARCH,
     DOCUMENT_ACTION_TYPE_ANALYZE: ASSIGNED_KNOWLEDGE_USER_ACTION_ANALYZE,
@@ -320,6 +327,14 @@ FOUNDRY_AGENT_LABELS = {
     'new_foundry': 'New Foundry Application',
     'foundry_workflow': 'Foundry Workflow',
 }
+
+
+class ChatAgentInitializationError(RuntimeError):
+    """Prevent an explicit agent selection from silently becoming model-only chat."""
+
+    def __init__(self, status_code=503):
+        super().__init__('Selected chat agent initialization failed.')
+        self.status_code = status_code
 
 
 def _is_foundry_selected_agent_type(agent_type):
@@ -3578,6 +3593,69 @@ def _has_chat_agent_selection(agent_selection):
         selected_id = str(agent_selection.get('id') or '').strip()
         return bool(selected_id or _get_chat_agent_selection_name(agent_selection))
     return bool(_get_chat_agent_selection_name(agent_selection))
+
+
+def _initialize_chat_semantic_kernel(settings, user_id, agent_selection, redis_client=None):
+    """Bind the chat-selected agent without changing the shared startup runtime."""
+    if settings.get('per_user_semantic_kernel', False):
+        initialize_semantic_kernel(user_id=user_id, redis_client=redis_client)
+        return
+
+    if (
+        settings.get('enable_multi_agent_orchestration', False)
+        or not _has_chat_agent_selection(agent_selection)
+    ):
+        g.kernel = getattr(builtins, 'kernel', None)
+        g.kernel_agents = getattr(builtins, 'kernel_agents', None)
+        return
+
+    # An empty request binding must never inherit another agent's shared tools.
+    g.kernel = None
+    g.kernel_agents = {}
+    agent_config = _resolve_canonical_chat_agent(user_id, settings, agent_selection)
+    if not agent_config or not agent_config.get('is_global') or agent_config.get('is_group'):
+        log_event(
+            '[SK_CHAT] Selected global chat agent is unavailable.',
+            extra={'user_id': user_id},
+            level=logging.WARNING,
+        )
+        raise ChatAgentInitializationError(status_code=400)
+
+    try:
+        ensure_governance_access(
+            'governance_global_agents_usage',
+            user_id,
+            item_entity_type='global_agent',
+            item_id=str(agent_config.get('id') or agent_config.get('name') or ''),
+        )
+    except PermissionError as exc:
+        log_event(
+            '[SK_CHAT] Selected global chat agent was denied by governance.',
+            extra={'user_id': user_id, 'agent_id': agent_config.get('id')},
+            level=logging.WARNING,
+        )
+        raise ChatAgentInitializationError(status_code=403) from exc
+
+    kernel = Kernel()
+    load_plugins_for_kernel(kernel, [], settings, mode_label='global')
+    kernel, agents = load_single_agent_for_kernel(
+        kernel, agent_config, settings, g, mode_label='global',
+    )
+    if kernel is None or not agents:
+        log_event(
+            '[SK_CHAT] Selected global chat agent failed to initialize.',
+            extra={'user_id': user_id, 'agent_id': agent_config.get('id')},
+            level=logging.ERROR,
+        )
+        raise ChatAgentInitializationError()
+
+    g.kernel = kernel
+    g.kernel_agents = agents
+    log_event(
+        '[SK_CHAT] Initialized request-scoped global chat agent.',
+        extra={'user_id': user_id, 'agent_id': agent_config.get('id'), 'agent_name': agent_config.get('name')},
+        level=logging.INFO,
+    )
 
 
 def _is_explicit_external_retrieval_requested(
@@ -8294,14 +8372,16 @@ def build_multi_file_tabular_distinct_value_analysis(successful_results, failed_
 
 
 def get_kernel():
-    return getattr(g, 'kernel', None) or getattr(builtins, 'kernel', None)
+    if hasattr(g, 'kernel'):
+        return g.kernel
+    return getattr(builtins, 'kernel', None)
 
 
 def get_kernel_agents():
     g_agents = getattr(g, 'kernel_agents', None)
     builtins_agents = getattr(builtins, 'kernel_agents', None)
     log_event(f"[SK_CHAT] get_kernel_agents - g.kernel_agents: {type(g_agents)} ({len(g_agents) if g_agents else 0} agents), builtins.kernel_agents: {type(builtins_agents)} ({len(builtins_agents) if builtins_agents else 0} agents)", level=logging.INFO)
-    return g_agents or builtins_agents
+    return g_agents if hasattr(g, 'kernel_agents') else builtins_agents
 
 def is_personal_chat_conversation(conversation_item):
     """Return True when a conversation belongs to personal chat scope."""
@@ -20074,14 +20154,12 @@ def register_route_backend_chats(bp):
 
             enable_key_vault_secret_storage = settings.get('enable_key_vault_secret_storage', False)
             redis_client = None
-            # --- Semantic Kernel state management (per-user mode) ---
-            if enable_semantic_kernel and per_user_semantic_kernel:
-                redis_client = current_app.config.get('SESSION_REDIS') if 'current_app' in globals() else None
-                initialize_semantic_kernel(user_id=user_id, redis_client=redis_client)
-            elif enable_semantic_kernel:
-                # Global mode: set g.kernel/g.kernel_agents from builtins
-                g.kernel = getattr(builtins, 'kernel', None)
-                g.kernel_agents = getattr(builtins, 'kernel_agents', None)
+            if enable_semantic_kernel:
+                if per_user_semantic_kernel:
+                    redis_client = current_app.config.get('SESSION_REDIS') if 'current_app' in globals() else None
+                _initialize_chat_semantic_kernel(
+                    settings, user_id, request_agent_info, redis_client=redis_client,
+                )
             if per_user_semantic_kernel:
                 settings_agents = user_settings.get('agents', [])
                 logging.debug(f"[SK_CHAT] Per-user Semantic Kernel enabled. Using user-specific settings.")
@@ -21184,6 +21262,8 @@ def register_route_backend_chats(bp):
             return jsonify(error.payload), 400
         except M365PolicyError as error:
             return jsonify(error.payload), 403
+        except ChatAgentInitializationError as error:
+            return jsonify({'error': CHAT_AGENT_INITIALIZATION_ERROR_MESSAGE}), error.status_code
         except Exception as e:
             error_traceback = traceback.format_exc()
             debug_print(f"[CHAT_API_ERROR] Unhandled exception in chat_api: {str(e)}")
@@ -21503,15 +21583,12 @@ def register_route_backend_chats(bp):
 
                 # Initialize Semantic Kernel only after binding the selected agent's actions.
                 redis_client = None
-                if enable_semantic_kernel and per_user_semantic_kernel:
-                    redis_client = current_app.config.get('SESSION_REDIS') if 'current_app' in globals() else None
-                    initialize_semantic_kernel(user_id=user_id, redis_client=redis_client)
-                    debug_print(f"[DEBUG] Initialized Semantic Kernel for user {user_id}")
-                elif enable_semantic_kernel:
-                    # Global mode: set g.kernel/g.kernel_agents from builtins
-                    g.kernel = getattr(builtins, 'kernel', None)
-                    g.kernel_agents = getattr(builtins, 'kernel_agents', None)
-                    debug_print(f"[DEBUG] Using global Semantic Kernel")
+                if enable_semantic_kernel:
+                    if per_user_semantic_kernel:
+                        redis_client = current_app.config.get('SESSION_REDIS') if 'current_app' in globals() else None
+                    _initialize_chat_semantic_kernel(
+                        settings, user_id, request_agent_info, redis_client=redis_client,
+                    )
 
                 if enable_semantic_kernel and per_user_semantic_kernel:
                     try:
@@ -25583,6 +25660,11 @@ def register_route_backend_chats(bp):
                 yield f"data: {json.dumps({**error.payload, 'done': True})}\n\n"
             except M365PolicyError as error:
                 yield f"data: {json.dumps({**error.payload, 'done': True})}\n\n"
+            except ChatAgentInitializationError as error:
+                yield build_stream_error_event(
+                    CHAT_AGENT_INITIALIZATION_ERROR_MESSAGE,
+                    status_code=error.status_code,
+                )
             except Exception as e:
                 error_traceback = traceback.format_exc()
                 debug_print(f"[STREAM_API_ERROR] Unhandled exception: {str(e)}")

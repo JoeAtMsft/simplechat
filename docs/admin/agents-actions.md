@@ -36,6 +36,17 @@ Agents and actions can call tools, inspect documents, and automate work. Expose 
 
 The Agents Configuration section belongs to the Agents tab. Use it with the adjacent settings in this group so related rollout, access, and operational choices stay aligned.
 
+In global single-agent mode, select the agent explicitly in Chat. Each request
+loads that agent's saved instructions and assigned actions, rather than reusing
+the agent loaded when the server started. Switching agents or editing their
+configuration no longer requires a backend restart. Renames are refreshed when
+the selection and action assignments reference stable IDs.
+
+A successful SQL action connection test verifies connectivity, not which agent
+Chat is using. Check the Chat agent selection and that agent's assigned actions
+when troubleshooting missing SQL tools. Workspace Mode and multi-agent
+orchestration retain their existing initialization behavior.
+
 ### Agent Template Approvals {#agent-template-approvals-section}
 
 The Agent Template Approvals section belongs to the Agents tab. Use it with the adjacent settings in this group so related rollout, access, and operational choices stay aligned.
