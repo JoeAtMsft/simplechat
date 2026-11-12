@@ -3860,7 +3860,7 @@ def save_chunks(page_text_content, page_number, file_name, user_id, document_id,
     # Return token usage information for accumulation
     return token_usage
 
-def save_chunks_batch(chunks_data, user_id, document_id, group_id=None, public_workspace_id=None):
+def save_chunks_batch(chunks_data, user_id, document_id, group_id=None, public_workspace_id=None, progress_callback=None):
     """
     Save multiple chunks at once using batch embedding and batch AI Search upload.
     Significantly faster than calling save_chunks() per chunk.
@@ -3871,12 +3871,15 @@ def save_chunks_batch(chunks_data, user_id, document_id, group_id=None, public_w
         document_id: The document ID
         group_id: Optional group ID for group documents
         public_workspace_id: Optional public workspace ID for public documents
+        progress_callback: Optional callback(saved_count, last_chunk_info), after Search acknowledges a batch
 
     Returns:
-        dict with 'total_tokens', 'prompt_tokens', 'model_deployment_name'
+        dict with token usage and 'chunks_saved'
     """
-    from functions_content import generate_embeddings_batch
-
+    started = time.perf_counter()
+    log_event("[DOCUMENT_INGESTION] Saving content in embedding/Search batches.", extra={
+        "document_id": document_id, "input_chunks": len(chunks_data),
+    })
     current_time = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     is_group = group_id is not None
     is_public_workspace = public_workspace_id is not None
@@ -3927,102 +3930,30 @@ def save_chunks_batch(chunks_data, user_id, document_id, group_id=None, public_w
             continue
         chunks_to_save.append((chunk_info, enhanced_chunk_text))
 
-    total_token_usage = {'total_tokens': 0, 'prompt_tokens': 0, 'model_deployment_name': None}
+    total_token_usage = {'total_tokens': 0, 'prompt_tokens': 0, 'model_deployment_name': None, 'chunks_saved': 0}
     if not chunks_to_save:
         return total_token_usage
 
-    # Generate all embeddings in batches
-    texts = [enhanced_chunk_text for _, enhanced_chunk_text in chunks_to_save]
-    try:
-        embedding_results = generate_embeddings_batch(texts)
-    except Exception as e:
-        log_event(f"[SAVE_CHUNKS_BATCH] Error generating batch embeddings for document {document_id}: {e}", level=logging.ERROR)
-        raise
+    max_embedding_characters = get_embedding_safe_chunk_characters()
+    texts = []
+    for chunk_info, enhanced_chunk_text in chunks_to_save:
+        if len(enhanced_chunk_text) > max_embedding_characters:
+            log_event(
+                "Chunk exceeded the embedding character budget and was clamped for embedding only.",
+                extra={
+                    "document_id": document_id,
+                    "page_number": chunk_info['page_number'],
+                    "file_name": chunk_info['file_name'],
+                    "original_characters": len(enhanced_chunk_text),
+                    "clamped_characters": max_embedding_characters,
+                },
+                level=logging.WARNING,
+            )
+        texts.append(enhanced_chunk_text[:max_embedding_characters])
 
-    # Build all chunk documents
-    chunk_documents = []
-
-    for idx, (chunk_info, enhanced_chunk_text) in enumerate(chunks_to_save):
-        embedding, token_usage = embedding_results[idx]
-        page_number = chunk_info['page_number']
-        file_name = chunk_info['file_name']
-
-        if token_usage:
-            total_token_usage['total_tokens'] += token_usage.get('total_tokens', 0)
-            total_token_usage['prompt_tokens'] += token_usage.get('prompt_tokens', 0)
-            if not total_token_usage['model_deployment_name']:
-                total_token_usage['model_deployment_name'] = token_usage.get('model_deployment_name')
-
-        chunk_id = f"{document_id}_{page_number}"
-
-        if is_public_workspace:
-            chunk_document = {
-                "id": chunk_id,
-                "document_id": document_id,
-                "chunk_id": str(page_number),
-                "chunk_text": enhanced_chunk_text,
-                "embedding": embedding,
-                "file_name": file_name,
-                "chunk_keywords": [],
-                "chunk_summary": "",
-                "page_number": page_number,
-                "author": [],
-                "title": "",
-                "document_classification": "None",
-                "document_tags": metadata.get('tags', []),
-                "chunk_sequence": page_number,
-                "upload_date": current_time,
-                "version": version,
-                "public_workspace_id": public_workspace_id
-            }
-        elif is_group:
-            shared_group_ids = metadata.get('shared_group_ids', []) if metadata else []
-            chunk_document = {
-                "id": chunk_id,
-                "document_id": document_id,
-                "chunk_id": str(page_number),
-                "chunk_text": enhanced_chunk_text,
-                "embedding": embedding,
-                "file_name": file_name,
-                "chunk_keywords": [],
-                "chunk_summary": "",
-                "page_number": page_number,
-                "author": [],
-                "title": "",
-                "document_classification": "None",
-                "document_tags": metadata.get('tags', []),
-                "chunk_sequence": page_number,
-                "upload_date": current_time,
-                "version": version,
-                "group_id": group_id,
-                "shared_group_ids": shared_group_ids
-            }
-        else:
-            shared_user_ids = metadata.get('shared_user_ids', []) if metadata else []
-            chunk_document = {
-                "id": chunk_id,
-                "document_id": document_id,
-                "chunk_id": str(page_number),
-                "chunk_text": enhanced_chunk_text,
-                "embedding": embedding,
-                "file_name": file_name,
-                "chunk_keywords": [],
-                "chunk_summary": "",
-                "page_number": page_number,
-                "author": [],
-                "title": "",
-                "document_classification": "None",
-                "document_tags": metadata.get('tags', []),
-                "chunk_sequence": page_number,
-                "upload_date": current_time,
-                "version": version,
-                "user_id": user_id,
-                "shared_user_ids": shared_user_ids
-            }
-
-        chunk_documents.append(chunk_document)
-
-    # Batch upload to AI Search
+    metadata_seconds = time.perf_counter() - started
+    embedding_seconds = search_seconds = progress_seconds = 0.0
+    embedding_batches = iter_embeddings_batches(texts)
     try:
         if is_public_workspace:
             search_client = CLIENTS["search_client_public"]
@@ -4031,19 +3962,90 @@ def save_chunks_batch(chunks_data, user_id, document_id, group_id=None, public_w
         else:
             search_client = CLIENTS["search_client_user"]
 
-        # Upload in sub-batches of 32 to avoid request size limits
-        upload_batch_size = 32
-        for i in range(0, len(chunk_documents), upload_batch_size):
-            sub_batch = chunk_documents[i:i + upload_batch_size]
-            _execute_document_search_write(
+        embedding_started = time.perf_counter()
+        for embedding_results in embedding_batches:
+            embedding_seconds += time.perf_counter() - embedding_started
+            offset = total_token_usage['chunks_saved']
+            batch_chunks = chunks_to_save[offset:offset + len(embedding_results)]
+            chunk_documents = []
+            for (chunk_info, enhanced_chunk_text), (embedding, token_usage) in zip(batch_chunks, embedding_results):
+                page_number = chunk_info['page_number']
+                chunk_document = {
+                    "id": f"{document_id}_{page_number}",
+                    "document_id": document_id,
+                    "chunk_id": str(page_number),
+                    "chunk_text": enhanced_chunk_text,
+                    "embedding": embedding,
+                    "file_name": chunk_info['file_name'],
+                    "chunk_keywords": [],
+                    "chunk_summary": "",
+                    "page_number": page_number,
+                    "author": ensure_list(metadata.get('authors')),
+                    "title": metadata.get('title', ''),
+                    "document_classification": metadata.get('document_classification', 'None'),
+                    "document_tags": metadata.get('tags', []),
+                    "chunk_sequence": page_number,
+                    "upload_date": current_time,
+                    "version": version,
+                }
+                if is_public_workspace:
+                    chunk_document["public_workspace_id"] = public_workspace_id
+                elif is_group:
+                    chunk_document["group_id"] = group_id
+                    chunk_document["shared_group_ids"] = metadata.get('shared_group_ids', [])
+                else:
+                    chunk_document["user_id"] = user_id
+                    chunk_document["shared_user_ids"] = metadata.get('shared_user_ids', [])
+                chunk_documents.append(chunk_document)
+
+                if token_usage:
+                    total_token_usage['total_tokens'] += token_usage.get('total_tokens', 0)
+                    total_token_usage['prompt_tokens'] += token_usage.get('prompt_tokens', 0)
+                    if not total_token_usage['model_deployment_name']:
+                        total_token_usage['model_deployment_name'] = token_usage.get('model_deployment_name')
+
+            search_started = time.perf_counter()
+            indexing_results = _execute_document_search_write(
                 search_client,
                 "upload_documents",
-                documents=sub_batch,
+                documents=chunk_documents,
             )
+            if len(indexing_results) != len(chunk_documents):
+                raise RuntimeError("Azure AI Search returned an incomplete batch acknowledgement.")
+            search_seconds += time.perf_counter() - search_started
+            total_token_usage['chunks_saved'] += len(chunk_documents)
+            progress_started = time.perf_counter()
+            if progress_callback:
+                progress_callback(total_token_usage['chunks_saved'], batch_chunks[-1][0])
+            log_event("[DOCUMENT_INGESTION] Saved content batch.", extra={
+                "document_id": document_id,
+                "chunks_saved": total_token_usage['chunks_saved'],
+                "total_chunks": len(chunks_to_save),
+            })
+            progress_seconds += time.perf_counter() - progress_started
+            embedding_started = time.perf_counter()
 
+        if total_token_usage['chunks_saved'] != len(chunks_to_save):
+            raise RuntimeError("Not every content chunk was embedded and indexed.")
     except Exception as e:
-        log_event(f"[SAVE_CHUNKS_BATCH] Error uploading batch to AI Search for document {document_id}: {e}", level=logging.ERROR)
+        log_event(f"[DOCUMENT_INGESTION] Batch processing failed for document {document_id}: {e}", extra={
+            "chunks_saved": total_token_usage['chunks_saved'],
+            "total_chunks": len(chunks_to_save),
+            "elapsed_seconds": round(time.perf_counter() - started, 3),
+        }, level=logging.ERROR)
         raise
+    finally:
+        embedding_batches.close()
+
+    log_event("[DOCUMENT_INGESTION] Content batches complete.", extra={
+        "document_id": document_id,
+        "chunks_saved": total_token_usage['chunks_saved'],
+        "metadata_and_preparation_seconds": round(metadata_seconds, 3),
+        "embedding_seconds": round(embedding_seconds, 3),
+        "search_seconds": round(search_seconds, 3),
+        "progress_seconds": round(progress_seconds, 3),
+        "elapsed_seconds": round(time.perf_counter() - started, 3),
+    })
 
     return total_token_usage
 
@@ -10055,6 +10057,7 @@ def process_di_document(document_id, user_id, temp_file_path, original_filename,
 
             upload_to_blob(**args)
 
+        extraction_started = time.perf_counter()
         di_extracted_pages = []
         if is_legacy_doc:
             update_callback(status=f"Extracting legacy Word content from {chunk_effective_filename}...")
@@ -10119,6 +10122,15 @@ def process_di_document(document_id, user_id, temp_file_path, original_filename,
 
             except Exception as e:
                 raise Exception(f"Error extracting content from {chunk_effective_filename} with {engine_label}: {str(e)}")
+
+        log_event("[DOCUMENT_INGESTION] Extraction complete.", extra={
+            "document_id": document_id,
+            "file_name": chunk_effective_filename,
+            "file_chunk": idx,
+            "extraction_engine": extraction_engine,
+            "extracted_pages": len(di_extracted_pages),
+            "elapsed_seconds": round(time.perf_counter() - extraction_started, 3),
+        })
 
         # --- Multi-Modal Vision Analysis (for images only) - Must happen BEFORE save_chunks ---
         if is_image and enable_enhanced_citations and idx == 1:  # Only run once for first chunk
@@ -10304,47 +10316,66 @@ def process_di_document(document_id, user_id, temp_file_path, original_filename,
             estimated_total_items = doc_metadata_temp.get('number_of_pages', num_final_chunks) if doc_metadata_temp else num_final_chunks
 
             try:
-                for i, chunk_data in enumerate(final_chunks_to_save):
-                    chunk_index = chunk_data.get("page_number", i + 1) # Ensure page number exists
-                    chunk_content = chunk_data.get("content", "")
+                if is_pdf:
+                    batch_chunks = [
+                        {
+                            "page_text_content": chunk_data.get("content", ""),
+                            "page_number": chunk_data.get("page_number", i + 1),
+                            "file_name": chunk_effective_filename,
+                        }
+                        for i, chunk_data in enumerate(final_chunks_to_save)
+                        if chunk_data.get("content", "").strip()
+                    ]
 
-                    # A description-only image chunk has no OCR text by design; save_chunks()
-                    # supplies its text from the stored vision analysis.
-                    if not chunk_content.strip() and not chunk_data.get(VISION_DESCRIPTION_ONLY_CHUNK_FLAG):
-                        print(f"Skipping empty chunk index {chunk_index} for {chunk_effective_filename}.")
-                        continue
+                    def report_saved_batch(saved_count, last_chunk):
+                        update_callback(
+                            current_file_chunk=int(last_chunk["page_number"]),
+                            number_of_pages=estimated_total_items,
+                            status=f"Saved {saved_count}/{len(batch_chunks)} content chunks of {chunk_effective_filename}..."
+                        )
 
-                    update_callback(
-                        current_file_chunk=int(chunk_index),
-                        number_of_pages=estimated_total_items,
-                        status=f"Saving page/chunk {chunk_index}/{estimated_total_items} of {chunk_effective_filename}..."
+                    token_usage = save_chunks_batch(
+                        batch_chunks, user_id, document_id,
+                        group_id=group_id, public_workspace_id=public_workspace_id,
+                        progress_callback=report_saved_batch,
                     )
+                    total_final_chunks_processed += token_usage['chunks_saved']
+                    total_embedding_tokens += token_usage.get('total_tokens', 0)
+                    if not embedding_model_name:
+                        embedding_model_name = token_usage.get('model_deployment_name')
+                else:
+                    for i, chunk_data in enumerate(final_chunks_to_save):
+                        chunk_index = chunk_data.get("page_number", i + 1)
+                        chunk_content = chunk_data.get("content", "")
+                        if not chunk_content.strip() and not chunk_data.get(VISION_DESCRIPTION_ONLY_CHUNK_FLAG):
+                            print(f"Skipping empty chunk index {chunk_index} for {chunk_effective_filename}.")
+                            continue
 
-                    args = {
-                        "page_text_content": chunk_content,
-                        "page_number": chunk_index,
-                        "file_name": chunk_effective_filename,
-                        "user_id": user_id,
-                        "document_id": document_id
-                    }
-
-                    if is_public_workspace:
-                        args["public_workspace_id"] = public_workspace_id
-                    elif is_group:
-                        args["group_id"] = group_id
-
-                    token_usage = save_chunks(**args)
-
-                    # Accumulate embedding tokens
-                    if token_usage:
-                        total_embedding_tokens += token_usage.get('total_tokens', 0)
-                        if not embedding_model_name:
-                            embedding_model_name = token_usage.get('model_deployment_name')
-
-                    total_final_chunks_processed += 1
+                        update_callback(
+                            current_file_chunk=int(chunk_index),
+                            number_of_pages=estimated_total_items,
+                            status=f"Saving page/chunk {chunk_index}/{estimated_total_items} of {chunk_effective_filename}..."
+                        )
+                        args = {
+                            "page_text_content": chunk_content,
+                            "page_number": chunk_index,
+                            "file_name": chunk_effective_filename,
+                            "user_id": user_id,
+                            "document_id": document_id
+                        }
+                        if is_public_workspace:
+                            args["public_workspace_id"] = public_workspace_id
+                        elif is_group:
+                            args["group_id"] = group_id
+                        token_usage = save_chunks(**args)
+                        if token_usage:
+                            total_embedding_tokens += token_usage.get('total_tokens', 0)
+                            if not embedding_model_name:
+                                embedding_model_name = token_usage.get('model_deployment_name')
+                        total_final_chunks_processed += 1
                 print(f"Saved {num_final_chunks} content chunk(s) from {chunk_effective_filename}.")
             except Exception as e:
-                raise Exception(f"Error saving extracted content chunk index {chunk_index} for {chunk_effective_filename}: {repr(e)}\nTraceback:\n{traceback.format_exc()}")
+                raise Exception(f"Error saving extracted content for {chunk_effective_filename}: {repr(e)}\nTraceback:\n{traceback.format_exc()}") from e
 
         # Clean up local file chunk (if it's not the original temp file)
         if chunk_path != temp_file_path and os.path.exists(chunk_path):

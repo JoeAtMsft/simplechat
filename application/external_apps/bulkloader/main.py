@@ -563,6 +563,41 @@ def delete_workspace_file(file_id, user_id, workspace_id, active_workspace_scope
     return True
 
 
+def delete_all_workspace_files(files, user_id, workspace_id, active_workspace_scope, access_token):
+    """Delete every listed document. Server-side failures are reported and skipped; connection failures stop the run."""
+    total = len(files)
+    appLogger.info(
+        "Working on deletion of all %s documents in %s workspace %s.",
+        total, active_workspace_scope, workspace_id,
+    )
+    deleted = 0
+    failed = []
+    for index, file in enumerate(files, 1):
+        try:
+            delete_workspace_file(file.get("id"), user_id, workspace_id, active_workspace_scope, access_token)
+            deleted += 1
+        except requests.HTTPError as error:
+            detail = str(getattr(error.response, "text", "") or "").strip()[:300]
+            appLogger.error(
+                "Failed to delete %s (document %s): %s %s",
+                file.get("file_name"), file.get("id"), error, detail,
+            )
+            failed.append(file)
+        except ValueError as error:
+            appLogger.error("Failed to delete %s (document %s): %s", file.get("file_name"), file.get("id"), error)
+            failed.append(file)
+        except requests.RequestException:
+            appLogger.error(
+                "Connection failure after deleting %s of %s documents; stopping. Re-run to delete the remainder.",
+                deleted, total,
+            )
+            raise
+        if index % 100 == 0:
+            appLogger.info("Deletion progress: %s of %s processed (%s deleted, %s failed).", index, total, deleted, len(failed))
+    appLogger.info("Deleted %s of %s documents; %s failed.", deleted, total, len(failed))
+    return deleted, failed
+
+
 def get_uploading_workspace_files(files):
     return [
         file for file in files
@@ -674,9 +709,17 @@ def main():
     parser.add_argument("--stale-hours", type=float, default=DEFAULT_STALE_HOURS,
                         help="With clean, delete incomplete uploads last updated more than this many hours ago "
                              f"(default: {DEFAULT_STALE_HOURS}; 0 deletes every incomplete upload, including active ones)")
+    parser.add_argument("--all", action="store_true", dest="delete_all",
+                        help="With delete, remove EVERY document in the workspace (required for delete)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="With delete, show what would be deleted without deleting anything")
+    parser.add_argument("--yes", action="store_true",
+                        help="With delete, skip the typed workspace-ID confirmation")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Show per-file activity and HTTP diagnostics (default: summaries, warnings, and errors)")
     args = parser.parse_args()
+    if args.auth == "application" and args.userid is None:
+        args.userid = os.getenv("BULKLOADER_USER_ID") or None
     direct_upload = args.action == "upload" and args.folder is not None
     if args.folder is not None and args.action != "upload":
         parser.error("folder is only supported with --action upload.")
@@ -707,6 +750,10 @@ def main():
         parser.error("stale-hours is only supported with --action clean.")
     if not math.isfinite(args.stale_hours) or args.stale_hours < 0:
         parser.error("stale-hours must be a non-negative number.")
+    if (args.delete_all or args.dry_run or args.yes) and args.action != "delete":
+        parser.error("all, dry-run, and yes are only supported with --action delete.")
+    if args.action == "delete" and not args.delete_all:
+        parser.error("--action delete removes every document in the workspace and requires --all.")
     try:
         configure_logging(args.verbose)
         appLogger.info("Starting %s operation.", args.action)
@@ -766,8 +813,32 @@ def main():
                 print(f"Total documents: {len(files)}")
             return 0
         if args.action == "delete":
-            appLogger.warning("--action delete is not implemented; no documents were deleted.")
-            return 0
+            total = len(files)
+            appLogger.info(
+                "Delete target: %s documents in %s workspace %s.", total, args.scope, args.workspaceid,
+            )
+            if total == 0:
+                appLogger.info("Nothing to delete.")
+                return 0
+            for sample in files[:5]:
+                appLogger.info("  e.g. %s (%s)", sample.get("file_name"), sample.get("id"))
+            if args.dry_run:
+                appLogger.info("Dry run: no documents were deleted.")
+                return 0
+            if not args.yes:
+                try:
+                    answer = input(
+                        f"Type the workspace ID ({args.workspaceid.strip()}) to permanently delete all {total} documents: "
+                    ).strip()
+                except EOFError:
+                    answer = ""
+                if answer != args.workspaceid.strip():
+                    appLogger.warning("Confirmation did not match; no documents were deleted.")
+                    return 1
+            _, failed = delete_all_workspace_files(
+                files, args.userid, args.workspaceid, args.scope, g_ACCESS_TOKEN
+            )
+            return 1 if failed else 0
         deleted = delete_failed_workspace_files(
             files, args.userid, args.workspaceid, args.scope, g_ACCESS_TOKEN,
             stale_hours=args.stale_hours,

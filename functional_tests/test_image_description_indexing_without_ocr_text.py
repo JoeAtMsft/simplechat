@@ -546,20 +546,21 @@ def check_save_chunks_batch_matches_save_chunks(documents, content):
 
     def fake_batch(texts):
         batched_inputs.append(list(texts))
-        return [([0.1, 0.2], {"total_tokens": 5, "prompt_tokens": 5, "model_deployment_name": "text-embedding-3-small"}) for _ in texts]
+        yield [([0.1, 0.2], {"total_tokens": 5, "prompt_tokens": 5, "model_deployment_name": "text-embedding-3-small"}) for _ in texts]
 
     def fake_search_write(search_client, operation_name, *args, **kwargs):
         uploaded_documents.extend(kwargs.get("documents") or [])
-        return [{"succeeded": True}]
+        return [{"succeeded": True} for _ in kwargs["documents"]]
 
     def run(metadata, chunks):
         batched_inputs.clear()
         uploaded_documents.clear()
         with ExitStack() as stack:
             stack.enter_context(patch.object(documents, "get_document_metadata", lambda **_: copy.deepcopy(metadata)))
-            stack.enter_context(patch.object(content, "generate_embeddings_batch", fake_batch))
+            stack.enter_context(patch.object(documents, "iter_embeddings_batches", fake_batch))
             stack.enter_context(patch.object(documents, "_execute_document_search_write", fake_search_write))
             stack.enter_context(patch.object(documents, "log_event", lambda *a, **k: None))
+            stack.enter_context(patch.object(documents, "get_embedding_safe_chunk_characters", lambda: 100000))
             stack.enter_context(patch.dict(documents.CLIENTS, {"search_client_user": object()}))
             return documents.save_chunks_batch(chunks, "user-1", "doc-1583")
 

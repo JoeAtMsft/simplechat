@@ -311,7 +311,8 @@ summary shows the filtered count and the full workspace total. Without this flag
 listing is unchanged. The flag is supported only with `--action list` and never
 changes or deletes documents.
 
-`--userid` is required for listing in application mode. The server checks that
+`--userid` is required for listing in application mode, unless `BULKLOADER_USER_ID`
+is set in `.env`; the command-line value overrides it. The server checks that
 user's role in the public workspace (any member can list; Owner, Admin, or
 DocumentManager is needed to upload or delete).
 Authentication uses the selected mode and still requires the `ExternalApi` role.
@@ -374,9 +375,41 @@ one completed copy when available, otherwise the first copy listed. It operates
 only on records remaining after stale/failed cleanup, so records are not deleted
 twice.
 
-The legacy `--action delete` option remains unimplemented: it lists documents
-but does not delete them. Use `clean` only for the criteria described above;
-it is not a delete-all command.
+## Delete every document in a workspace
+
+`--action delete` removes **all** documents from one workspace. It is
+destructive and permanent: the documents, their chunks, search-index rows, and
+any stored source files are deleted. Local files are not touched.
+
+First preview what would be deleted (nothing is changed):
+
+```powershell
+python .\main.py --action delete --all --dry-run --scope public --workspaceid public-workspace-id
+```
+
+Then run it. You are asked to type the workspace ID to confirm; add `--yes` to
+skip that prompt for unattended runs:
+
+```powershell
+python .\main.py --action delete --all --scope public --workspaceid public-workspace-id
+```
+
+Behavior:
+
+- `--all` is required. Without it, `--action delete` is rejected.
+- `--userid` is required in application mode, with the same `BULKLOADER_USER_ID`
+  fallback as the other actions. The caller needs Owner, Admin, or
+  DocumentManager in the workspace.
+- A server error on one document (for example a stale "ghost" entry whose
+  record no longer exists) is logged with the server's message and skipped;
+  the run continues and the exit status is `1`.
+- A connection failure stops the run immediately. Re-run it to delete whatever
+  remains; documents already deleted are not listed again.
+- Progress is logged every 100 documents, with a final summary.
+- Run `--action list` afterwards to confirm the workspace is empty.
+
+Use `clean` instead when you only want to remove failed or stuck uploads; it
+never removes completed documents.
 
 ## Regression tests
 

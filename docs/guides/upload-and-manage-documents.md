@@ -133,6 +133,25 @@ You'll see different status indicators during processing:
 - **❌ Error**: Processing failed (see error message)
 - **⏳ Queued**: Waiting for processing resources
 
+### PDF Processing Performance
+
+As of version **0.261.063**, PDF ingestion embeds and indexes content in bounded batches
+of up to 16 chunks, reusing one embedding client per file chunk and reading document
+metadata once for the batch-saving operation. Search writes still use the migration
+write fence and must acknowledge every chunk before progress advances. Chunk IDs,
+page references, full stored text, classification, sharing, and vision descriptions
+are preserved. Oversized text is clamped only for embedding, not for storage.
+
+The server logs `[DOCUMENT_INGESTION]` extraction timings, acknowledged batch progress,
+and completion totals separating metadata/preparation, embeddings, Search, and
+progress updates. Embedding time includes rate-limit waits. Failed batches log the
+number of chunks already indexed and leave processing failed, not complete.
+
+This reduces request overhead without adding nested workers to the existing document
+executor. It does not change Document Intelligence extraction speed or Azure service
+quotas. Compare the same PDF before and after deployment using these timings; request
+count reductions alone are not a measured wall-clock speedup.
+
 ## Step 3: Upload to Group Workspaces
 
 Group workspaces require additional setup:

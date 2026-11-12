@@ -54,6 +54,7 @@ def listing(documents, page=1, total=None):
 class LoaderTestCase(unittest.TestCase):
     def setUp(self):
         patches = [
+            patch.dict(os.environ, {"BULKLOADER_USER_ID": ""}),
             patch.object(loader, "appLogger"),
             patch.object(loader, "successFileLogger"),
             patch.object(loader, "ignoredFileLogger"),
@@ -677,6 +678,8 @@ class CommandTests(LoaderTestCase):
             args = ["-a", action]
             if action != "upload":
                 args.extend(["-s", "public", "-w", "workspace", "-u", "user"])
+            if action == "delete":
+                args.extend(["--all", "--yes"])
             with self.subTest(action=action), patch.object(
                 loader, "get_workspace_files", return_value=[]
             ), patch.object(loader, "read_csv_ignore_header", return_value=Counter()), patch(
@@ -852,6 +855,22 @@ class CommandTests(LoaderTestCase):
                 "-a", "list", "-u", "u", "-w", "w", "-s", "public",
             ]), 0)
         self.assertEqual(self.request.call_args.kwargs["params"]["user_id"], "u")
+
+    def test_default_user_id_comes_from_environment_for_application_auth(self):
+        self.request.side_effect = [listing([])]
+        with patch.dict(os.environ, {"BULKLOADER_USER_ID": "env-user"}), patch(
+            "sys.stdout", new_callable=io.StringIO
+        ):
+            self.assertEqual(self.run_main(["-a", "list", "-w", "w", "-s", "public"]), 0)
+        self.assertEqual(self.request.call_args.kwargs["params"]["user_id"], "env-user")
+
+    def test_command_line_user_id_overrides_environment_default(self):
+        self.request.side_effect = [listing([])]
+        with patch.dict(os.environ, {"BULKLOADER_USER_ID": "env-user"}), patch(
+            "sys.stdout", new_callable=io.StringIO
+        ):
+            self.assertEqual(self.run_main(["-a", "list", "-u", "cli-user", "-w", "w", "-s", "public"]), 0)
+        self.assertEqual(self.request.call_args.kwargs["params"]["user_id"], "cli-user")
 
     def test_write_operations_still_require_user_id(self):
         for action in ["clean", "delete"]:
@@ -1093,15 +1112,86 @@ class CommandTests(LoaderTestCase):
                 "--action", "clean", "-u", "u", "-w", "w", "-s", "group"
             ]), 1)
 
-    def test_standalone_delete_remains_non_destructive(self):
-        with patch.object(loader, "get_workspace_files", return_value=[document()]), patch.object(
+    def test_delete_requires_all_flag(self):
+        with patch("sys.argv", ["main.py", "-a", "delete", "-u", "u", "-w", "w", "-s", "public"]), patch("sys.stderr"):
+            with self.assertRaises(SystemExit) as error:
+                loader.main()
+        self.assertEqual(error.exception.code, 2)
+
+    def test_delete_flags_rejected_for_other_actions(self):
+        for flag in ["--all", "--dry-run", "--yes"]:
+            with self.subTest(flag=flag), patch("sys.argv", [
+                "main.py", "-a", "clean", "-u", "u", "-w", "w", "-s", "public", flag,
+            ]), patch("sys.stderr"):
+                with self.assertRaises(SystemExit) as error:
+                    loader.main()
+                self.assertEqual(error.exception.code, 2)
+
+    def test_delete_dry_run_deletes_nothing(self):
+        docs = [document(id=f"id-{n}", name=f"f{n}.pdf") for n in range(3)]
+        with patch.object(loader, "get_workspace_files", return_value=docs), patch.object(
             loader, "delete_workspace_file"
         ) as delete:
             self.assertEqual(self.run_main([
-                "--action", "delete", "-u", "u", "-w", "w", "-s", "public"
+                "--action", "delete", "--all", "--dry-run", "-u", "u", "-w", "w", "-s", "public",
             ]), 0)
         delete.assert_not_called()
-        loader.appLogger.warning.assert_called()
+
+    def test_delete_requires_matching_workspace_id_confirmation(self):
+        docs = [document(id="id-1"), document(id="id-2")]
+        with patch.object(loader, "get_workspace_files", return_value=docs), patch.object(
+            loader, "delete_workspace_file"
+        ) as delete, patch("builtins.input", return_value="wrong"):
+            self.assertEqual(self.run_main([
+                "--action", "delete", "--all", "-u", "u", "-w", "workspace-1", "-s", "public",
+            ]), 1)
+        delete.assert_not_called()
+
+    def test_delete_all_with_confirmation_deletes_every_document(self):
+        docs = [document(id=f"id-{n}") for n in range(4)]
+        with patch.object(loader, "get_workspace_files", return_value=docs), patch.object(
+            loader, "delete_workspace_file", return_value=True
+        ) as delete, patch("builtins.input", return_value="workspace-1"):
+            self.assertEqual(self.run_main([
+                "--action", "delete", "--all", "-u", "u", "-w", "workspace-1", "-s", "public",
+            ]), 0)
+        self.assertEqual([call.args[0] for call in delete.call_args_list], [f"id-{n}" for n in range(4)])
+
+    def test_delete_all_continues_after_server_failure_and_exits_nonzero(self):
+        docs = [document(id="ok-1"), document(id="ghost"), document(id="ok-2")]
+        ghost_error = requests.HTTPError("HTTP 500", response=Mock(text="(NotFound) Entity does not exist"))
+
+        def fake_delete(file_id, *args):
+            if file_id == "ghost":
+                raise ghost_error
+            return True
+
+        with patch.object(loader, "get_workspace_files", return_value=docs), patch.object(
+            loader, "delete_workspace_file", side_effect=fake_delete
+        ) as delete:
+            self.assertEqual(self.run_main([
+                "--action", "delete", "--all", "--yes", "-u", "u", "-w", "w", "-s", "public",
+            ]), 1)
+        self.assertEqual([call.args[0] for call in delete.call_args_list], ["ok-1", "ghost", "ok-2"])
+
+    def test_delete_all_stops_on_connection_failure(self):
+        docs = [document(id=f"id-{n}") for n in range(3)]
+        with patch.object(loader, "get_workspace_files", return_value=docs), patch.object(
+            loader, "delete_workspace_file", side_effect=requests.ConnectionError("down")
+        ) as delete:
+            self.assertEqual(self.run_main([
+                "--action", "delete", "--all", "--yes", "-u", "u", "-w", "w", "-s", "public",
+            ]), 1)
+        self.assertEqual(delete.call_count, 1)
+
+    def test_delete_with_no_documents_is_a_no_op(self):
+        with patch.object(loader, "get_workspace_files", return_value=[]), patch.object(
+            loader, "delete_workspace_file"
+        ) as delete:
+            self.assertEqual(self.run_main([
+                "--action", "delete", "--all", "--yes", "-u", "u", "-w", "w", "-s", "public",
+            ]), 0)
+        delete.assert_not_called()
 
     def test_clean_requires_destination_flags(self):
         with patch("sys.argv", ["main.py", "--action", "clean"]), patch("sys.stderr"):

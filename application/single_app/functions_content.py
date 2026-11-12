@@ -3,6 +3,7 @@
 import email.utils
 import struct
 import zipfile
+from contextlib import ExitStack
 from xml.etree import ElementTree
 
 import olefile
@@ -1349,98 +1350,103 @@ def generate_embeddings_batch(
     initial_delay=1.0,
     delay_multiplier=2.0
 ):
-    """Generate embeddings for multiple texts in batches.
+    """Return ordered (embedding, token_usage) pairs for all input texts."""
+    return [
+        result
+        for batch in iter_embeddings_batches(
+            texts, batch_size, max_retries, initial_delay, delay_multiplier
+        )
+        for result in batch
+    ]
 
-    Azure OpenAI embeddings API accepts a list of strings as input.
-    This reduces per-call overhead and delay significantly.
 
-    Args:
-        texts: List of text strings to embed.
-        batch_size: Number of texts per API call (default 16).
-        max_retries: Max retries on rate limit errors.
-        initial_delay: Initial retry delay in seconds.
-        delay_multiplier: Multiplier for exponential backoff.
+def iter_embeddings_batches(
+    texts,
+    batch_size=16,
+    max_retries=5,
+    initial_delay=1.0,
+    delay_multiplier=2.0
+):
+    """Yield bounded, ordered embedding batches using one client for this operation."""
+    if batch_size < 1:
+        raise ValueError("Embedding batch_size must be positive.")
+    if not texts:
+        return
 
-    Returns:
-        list of (embedding, token_usage) tuples, one per input text.
-    """
     settings = get_settings()
-
+    embedding_model_obj = settings.get('embedding_model') or {}
+    selected_models = embedding_model_obj.get('selected') or []
     enable_embedding_apim = settings.get('enable_embedding_apim', False)
-
     if enable_embedding_apim:
         embedding_model = settings.get('azure_apim_embedding_deployment')
-        embedding_client = AzureOpenAI(
-            api_version=settings.get('azure_apim_embedding_api_version'),
-            azure_endpoint=settings.get('azure_apim_embedding_endpoint'),
-            api_key=settings.get('azure_apim_embedding_subscription_key'))
     else:
-        if (settings.get('azure_openai_embedding_authentication_type') == 'managed_identity'):
-            token_provider = get_bearer_token_provider(DefaultAzureCredential(), cognitive_services_scope)
+        embedding_model = selected_models[0].get('deploymentName') if selected_models else None
+    if not embedding_model:
+        raise ValueError("No embedding deployment is selected.")
 
-            embedding_client = AzureOpenAI(
-                api_version=settings.get('azure_openai_embedding_api_version'),
-                azure_endpoint=settings.get('azure_openai_embedding_endpoint'),
-                azure_ad_token_provider=token_provider
-            )
+    if enable_embedding_apim:
+        client_kwargs = {
+            "api_version": settings.get('azure_apim_embedding_api_version'),
+            "azure_endpoint": settings.get('azure_apim_embedding_endpoint'),
+            "api_key": settings.get('azure_apim_embedding_subscription_key'),
+        }
+    else:
+        client_kwargs = {
+            "api_version": settings.get('azure_openai_embedding_api_version'),
+            "azure_endpoint": settings.get('azure_openai_embedding_endpoint'),
+        }
 
-            embedding_model_obj = settings.get('embedding_model', {})
-            if embedding_model_obj and embedding_model_obj.get('selected'):
-                selected_embedding_model = embedding_model_obj['selected'][0]
-                embedding_model = selected_embedding_model['deploymentName']
-        else:
-            embedding_client = AzureOpenAI(
-                api_version=settings.get('azure_openai_embedding_api_version'),
-                azure_endpoint=settings.get('azure_openai_embedding_endpoint'),
-                api_key=settings.get('azure_openai_embedding_key')
-            )
+    with ExitStack() as resources:
+        if not enable_embedding_apim:
+            if settings.get('azure_openai_embedding_authentication_type') == 'managed_identity':
+                credential = DefaultAzureCredential()
+                resources.callback(credential.close)
+                client_kwargs["azure_ad_token_provider"] = get_bearer_token_provider(credential, cognitive_services_scope)
+            else:
+                client_kwargs["api_key"] = settings.get('azure_openai_embedding_key')
+        embedding_client = AzureOpenAI(**client_kwargs)
+        resources.callback(embedding_client.close)
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            retries = 0
+            current_delay = initial_delay
 
-            embedding_model_obj = settings.get('embedding_model', {})
-            if embedding_model_obj and embedding_model_obj.get('selected'):
-                selected_embedding_model = embedding_model_obj['selected'][0]
-                embedding_model = selected_embedding_model['deploymentName']
+            while True:
+                try:
+                    response = embedding_client.embeddings.create(
+                        model=embedding_model,
+                        input=batch
+                    )
+                    break
+                except RateLimitError as e:
+                    retries += 1
+                    if retries > max_retries:
+                        raise
 
-    results = []
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i + batch_size]
-        retries = 0
-        current_delay = initial_delay
+                    wait_time = _get_rate_limit_wait_time(e, current_delay)
+                    debug_print(
+                        f"[EMBEDDING_BATCH] Rate limited, retrying in {wait_time:.2f}s "
+                        f"(attempt {retries}/{max_retries})"
+                    )
+                    time.sleep(wait_time)
+                    current_delay *= delay_multiplier
 
-        while True:
-            random_delay = random.uniform(0.05, 0.2)
-            time.sleep(random_delay)
+            ordered_items = sorted(response.data, key=lambda item: item.index)
+            if [item.index for item in ordered_items] != list(range(len(batch))):
+                raise ValueError("Embedding response did not contain exactly one result per input.")
+            if any(not item.embedding for item in ordered_items):
+                raise ValueError("Embedding response contained an empty vector.")
 
-            try:
-                response = embedding_client.embeddings.create(
-                    model=embedding_model,
-                    input=batch
-                )
-
-                for item in response.data:
-                    token_usage = None
-                    if hasattr(response, 'usage') and response.usage:
-                        token_usage = {
-                            'prompt_tokens': response.usage.prompt_tokens // len(batch),
-                            'total_tokens': response.usage.total_tokens // len(batch),
-                            'model_deployment_name': embedding_model
-                        }
-                    results.append((item.embedding, token_usage))
-                break
-
-            except RateLimitError as e:
-                retries += 1
-                if retries > max_retries:
-                    raise
-
-                wait_time = _get_rate_limit_wait_time(e, current_delay)
-                debug_print(
-                    f"[EMBEDDING_BATCH] Rate limited, retrying in {wait_time:.2f}s "
-                    f"(attempt {retries}/{max_retries})"
-                )
-                time.sleep(wait_time)
-                current_delay *= delay_multiplier
-
-            except Exception as e:
-                raise
-
-    return results
+            results = []
+            usage = getattr(response, 'usage', None)
+            for index, item in enumerate(ordered_items):
+                token_usage = None
+                if usage:
+                    # Preserve the exact service totals, including integer-division remainders.
+                    token_usage = {
+                        'prompt_tokens': usage.prompt_tokens // len(batch) + int(index < usage.prompt_tokens % len(batch)),
+                        'total_tokens': usage.total_tokens // len(batch) + int(index < usage.total_tokens % len(batch)),
+                        'model_deployment_name': embedding_model
+                    }
+                results.append((item.embedding, token_usage))
+            yield results

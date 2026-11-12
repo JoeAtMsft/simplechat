@@ -12,6 +12,7 @@ from 429 responses before falling back to local exponential backoff.
 import email.utils
 import importlib
 import os
+import re
 import sys
 import time as real_time
 import types
@@ -28,7 +29,7 @@ class FakeRateLimitError(Exception):
 
 class FakeEmbeddingResponse:
     def __init__(self, embeddings, prompt_tokens=12, total_tokens=12):
-        self.data = [types.SimpleNamespace(embedding=embedding) for embedding in embeddings]
+        self.data = [types.SimpleNamespace(index=index, embedding=embedding) for index, embedding in enumerate(embeddings)]
         self.usage = types.SimpleNamespace(
             prompt_tokens=prompt_tokens,
             total_tokens=total_tokens,
@@ -52,6 +53,9 @@ class FakeAzureOpenAI:
     def __init__(self, *args, **kwargs):
         self.embeddings = FakeEmbeddingsEndpoint(type(self).scripted_results)
 
+    def close(self):
+        pass
+
 
 class SleepRecorder:
     def __init__(self):
@@ -72,6 +76,8 @@ def _restore_modules(original_modules):
 def _load_functions_content(sleep_recorder):
     config_stub = types.ModuleType('config')
     config_stub.time = types.SimpleNamespace(time=real_time.time, sleep=sleep_recorder)
+    config_stub.re = re
+    config_stub.WORD_CHUNK_SIZE = 400
     config_stub.random = types.SimpleNamespace(uniform=lambda low, high: low)
     config_stub.AzureOpenAI = FakeAzureOpenAI
     config_stub.RateLimitError = FakeRateLimitError
